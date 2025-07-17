@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.0-2_20250716"
+__version__   = "0.2.1-1_20250717"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -21,6 +21,7 @@ import time
 import tty
 from argparse import ArgumentParser
 from collections import deque
+from re import compile as re_compile
 from typing import Dict, Iterable, List
 
 PAUSED    = False
@@ -28,6 +29,7 @@ QUITTING  = False
 MY_NAME   = os.path.basename(__file__)
 TERM_ATTR = termios.tcgetattr(sys.stdin.fileno())
 INTERVAL  = 0.0
+ANSI_REGX = re_compile(r'\x1b\[[0-9;]*m')   # matches standard ANSI color escape sequences
 DISKSTATS = '/proc/diskstats'
 RBD_GLOB  = '/dev/rbd/*/*'
 HEADERS   = ('Pool', 'RBD name', 'Dev', 'Size',
@@ -67,6 +69,31 @@ def parse_cmdline_args():
     return p
 
 
+def _CC(*args):
+    """Make an ANSI control code string."""
+    return f"\033[{';'.join(str(i) for i in args)}m"
+
+
+def RED(_s: str):
+    """Make a string bold red."""
+    return f'{_CC(31, 1)}{_s}{_CC(0)}'
+
+
+def GRN(_s: str):
+    """Make a string bold green."""
+    return f'{_CC(32, 1)}{_s}{_CC(0)}'
+
+
+def YEL(_s: str):
+    """Make a string bold yellow."""
+    return f'{_CC(33, 1)}{_s}{_CC(0)}'
+
+
+def BOLD(_s: str):
+    """Make a string bold."""
+    return f'{_CC(1)}{_s}{_CC(0)}'
+
+
 def eprint(*values, **kwargs):
     """Mimic print() but write to stderr."""
     print(*values, file=sys.stderr, **kwargs)
@@ -77,7 +104,7 @@ def read_oneline_file(f: str):
     return open(f, encoding='utf-8').readline()
 
 
-def simple_tabulate(data: Iterable[Iterable], headers: List = None, missing = '-'):
+def simple_tabulate(data: Iterable[Iterable], headers: Iterable = None, missing = '-'):
     """
     Format a list of iterables as a table for printing.
 
@@ -89,35 +116,46 @@ def simple_tabulate(data: Iterable[Iterable], headers: List = None, missing = '-
     Returns:
         String containing the formatted table
     """
+    def visible_len(s: str) -> int:
+        """Return the visible length of a string, ignoring ANSI escape codes."""
+        return len(ANSI_REGX.sub('', s))
+
     def format_row(row: tuple[str], widths: List[int]):
         """Format a single row (with padding if needed)."""
-        items = [item.ljust(widths[i]) for i, item in enumerate(row)]
+        items = []
+        for i, item in enumerate(row):
+            vis_len = visible_len(item)
+            pad = ' ' * (widths[i] - vis_len)
+            items.append(item + pad)
         diff = len(widths) - len(items)
         if diff > 0:
             # pad with `missing` value(s) if the row is too short
-            items.extend([missing.ljust(widths[i+len(items)]) for i in range(diff)])
+            missing_vis_len = visible_len(missing)
+            for j in range(diff):
+                pad = ' ' * (widths[len(items) + j] - missing_vis_len)
+                items.append(missing + pad)
         return ' | '.join(items)
 
     all_rows: List[tuple[str]] = []
-    if headers:
+    if headers is not None:
         all_rows.append(tuple(str(h) for h in headers))
     for row in data:
         all_rows.append(tuple(str(item) if item is not None else missing for item in row))
     if not all_rows:
         return ''
 
-    # Find the maximum width needed for each column
+    # Find the maximum width needed for each column (based on visible lengths)
     columns = 1
     for row in all_rows:
         columns = max(len(row), columns)
     widths = [0] * columns
     for row in all_rows:
         for i, item in enumerate(row):
-            widths[i] = max(widths[i], len(item))
+            widths[i] = max(widths[i], visible_len(item))
 
     # Format each row with appropriate padding
     formatted_rows: List[str] = []
-    if headers:
+    if headers is not None:
         # Format headers with a separator line if headers are provided
         formatted_rows.append(format_row(all_rows[0], widths))
         separator = '-+-'.join('-' * w for w in widths)
