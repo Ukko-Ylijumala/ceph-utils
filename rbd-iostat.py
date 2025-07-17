@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.0-1_20250716"
+__version__   = "0.2.0-2_20250716"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -31,15 +31,15 @@ INTERVAL  = 0.0
 DISKSTATS = '/proc/diskstats'
 RBD_GLOB  = '/dev/rbd/*/*'
 HEADERS   = ('Pool', 'RBD name', 'Dev', 'Size',
-             'rd/s  ', 'rd MB/s', 'rdrqm/s', '%rdrqm', 'r_await', 'rareq-sz',   # reads
-             'wr/s  ', 'wr MB/s', 'wrrqm/s', '%wrrqm', 'w_await', 'wareq-sz',   # writes
-             #'f/s',    'f_await',   # flushes
+             'r_iops', 'w_iops', 'rd MB/s', 'wr MB/s', 'rdrqm/s', '%rdrqm',
+             'wrrqm/s', '%wrrqm','r_await', 'w_await', 'rareq-sz', 'wareq-sz',
              'aqu-sz',  '%util')    # queue length and utilization
 DISCARD_H = ('ds/s',   'ds MB/s', 'dsrqm/s', '%dsrqm', 'd_await', 'dareq-sz')   # discard
 SORT_FLDS = ('pool', 'rbd', 'dev',
              'r_io', 'r_mb', 'r_rqm', 'r_rqm_pct', 'r_wait', 'r_sz',
              'w_io', 'w_mb', 'w_rqm', 'w_rqm_pct', 'w_wait', 'w_sz',
              'queue', 'util', 'total_io')
+             #'f/s',    'f_await',   # flushes
 
 
 def parse_cmdline_args():
@@ -257,25 +257,25 @@ def sort_stats(stats: List[List[str]], key: str | None):
             stats.sort(key=lambda x: x[2])
         case 'r_io':
             stats.sort(key=lambda x: (int(x[4]), x[1]), reverse=True)
-        case 'r_mb':
-            stats.sort(key=lambda x: (float(x[5]), x[1]), reverse=True)
-        case 'r_rqm':
-            stats.sort(key=lambda x: (float(x[6]), x[1]), reverse=True)
-        case 'r_rqm_pct':
-            stats.sort(key=lambda x: (float(x[7]), x[1]), reverse=True)
-        case 'r_wait':
-            stats.sort(key=lambda x: (float(x[8]), x[1]), reverse=True)
-        case 'r_sz':
-            stats.sort(key=lambda x: (float(x[9]), x[1]), reverse=True)
         case 'w_io':
-            stats.sort(key=lambda x: (int(x[10]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (int(x[5]), x[1]), reverse=True)
+        case 'r_mb':
+            stats.sort(key=lambda x: (float(x[6]), x[1]), reverse=True)
         case 'w_mb':
-            stats.sort(key=lambda x: (float(x[11]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (float(x[7]), x[1]), reverse=True)
+        case 'r_rqm':
+            stats.sort(key=lambda x: (int(x[8]), x[1]), reverse=True)
+        case 'r_rqm_pct':
+            stats.sort(key=lambda x: (float(x[9]), x[1]), reverse=True)
         case 'w_rqm':
-            stats.sort(key=lambda x: (float(x[12]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (int(x[10]), x[1]), reverse=True)
         case 'w_rqm_pct':
-            stats.sort(key=lambda x: (float(x[13]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (float(x[11]), x[1]), reverse=True)
+        case 'r_wait':
+            stats.sort(key=lambda x: (float(x[12]), x[1]), reverse=True)
         case 'w_wait':
+            stats.sort(key=lambda x: (float(x[13]), x[1]), reverse=True)
+        case 'r_sz':
             stats.sort(key=lambda x: (float(x[14]), x[1]), reverse=True)
         case 'w_sz':
             stats.sort(key=lambda x: (float(x[15]), x[1]), reverse=True)
@@ -285,7 +285,7 @@ def sort_stats(stats: List[List[str]], key: str | None):
             stats.sort(key=lambda x: (float(x[17]), x[1]), reverse=True)
         case 'total_io':
             # combine read and write IOPS
-            stats.sort(key=lambda x: (int(x[4]) + int(x[10]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (int(x[4]) + int(x[5]), x[1]), reverse=True)
         case _:
             return
 
@@ -335,16 +335,16 @@ def parse_data(mapping: Dict, prev: Dict, now: Dict, delta_t: float, disc: bool)
             dev,                # /dev/rbdX
             humanize_size(mapping[dev][2] * 512),  # RBD exposes 512-byte blocks
             f"{r_s:.0f}",       # read I/O per second
-            f"{r_mb_s:.1f}",    # read MB/s
-            f"{rrqm_s:.1f}",    # read requests merged per second
-            f"{p_rrqm:.2f}",  # read requests merged percentage
-            f"{r_await:.2f}",   # read await time
-            f"{rareq_sz:.1f}",  # avg read request size
             f"{w_s:.0f}",
+            f"{r_mb_s:.1f}",    # read MB/s
             f"{w_mb_s:.1f}",
-            f"{wrqm_s:.1f}",
+            f"{rrqm_s:.0f}",    # read requests merged per second
+            f"{p_rrqm:.2f}",    # read requests merged percentage
+            f"{wrqm_s:.0f}",
             f"{p_wrqm:.2f}",
+            f"{r_await:.2f}",   # read await time
             f"{w_await:.2f}",
+            f"{rareq_sz:.1f}",  # avg read request size
             f"{wareq_sz:.1f}",
             f"{aqu_sz:.1f}",    # average queue size
             f"{util:.2f}",      # device utilization %
