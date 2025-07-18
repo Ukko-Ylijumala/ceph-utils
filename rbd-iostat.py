@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.1-1_20250717"
+__version__   = "0.2.2-1_20250717"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -29,14 +29,14 @@ QUITTING  = False
 MY_NAME   = os.path.basename(__file__)
 TERM_ATTR = termios.tcgetattr(sys.stdin.fileno())
 INTERVAL  = 0.0
-ANSI_REGX = re_compile(r'\x1b\[[0-9;]*m')   # matches standard ANSI color escape sequences
+ANSI_RX   = re_compile(r'\x1b\[[0-9;]*m')   # matches standard ANSI color escape sequences
 DISKSTATS = '/proc/diskstats'
 RBD_GLOB  = '/dev/rbd/*/*'
 HEADERS   = ('Pool', 'RBD name', 'Dev', 'Size',
-             'r_iops', 'w_iops', 'rd MB/s', 'wr MB/s', 'rdrqm/s', '%rdrqm',
-             'wrrqm/s', '%wrrqm','r_await', 'w_await', 'rareq-sz', 'wareq-sz',
+             'r_iops', 'w_iops', 'rd MB/s', 'wr MB/s', 'r_rqm/s', '%r_rqm',
+             'w_rqm/s', '%w_rqm','r_await', 'w_await', 'rareq-sz', 'wareq-sz',
              'aqu-sz',  '%util')    # queue length and utilization
-DISCARD_H = ('ds/s',   'ds MB/s', 'dsrqm/s', '%dsrqm', 'd_await', 'dareq-sz')   # discard
+DISCARD_H = ('d_iops',   'ds MB/s', 'd_rqm/s', '%d_rqm', 'd_await', 'dareq-sz')   # discard
 SORT_FLDS = ('pool', 'rbd', 'dev',
              'r_io', 'r_mb', 'r_rqm', 'r_rqm_pct', 'r_wait', 'r_sz',
              'w_io', 'w_mb', 'w_rqm', 'w_rqm_pct', 'w_wait', 'w_sz',
@@ -73,25 +73,33 @@ def _CC(*args):
     """Make an ANSI control code string."""
     return f"\033[{';'.join(str(i) for i in args)}m"
 
-
 def RED(_s: str):
     """Make a string bold red."""
-    return f'{_CC(31, 1)}{_s}{_CC(0)}'
-
+    return f'{_CC(91, 1)}{_s}{_CC(0)}'
 
 def GRN(_s: str):
     """Make a string bold green."""
     return f'{_CC(32, 1)}{_s}{_CC(0)}'
 
-
 def YEL(_s: str):
     """Make a string bold yellow."""
     return f'{_CC(33, 1)}{_s}{_CC(0)}'
 
+def BLU(_s: str):
+    """Make a string bold blue."""
+    return f'{_CC(34, 1)}{_s}{_CC(0)}'
+
+def MAG(_s: str):
+    """Make a string bold magenta."""
+    return f'{_CC(35, 1)}{_s}{_CC(0)}'
 
 def BOLD(_s: str):
     """Make a string bold."""
     return f'{_CC(1)}{_s}{_CC(0)}'
+
+def FAINT(_s: str):
+    """Make a string faint (dimmed)."""
+    return f'{_CC(2)}{_s}{_CC(0)}'
 
 
 def eprint(*values, **kwargs):
@@ -118,7 +126,7 @@ def simple_tabulate(data: Iterable[Iterable], headers: Iterable = None, missing 
     """
     def visible_len(s: str) -> int:
         """Return the visible length of a string, ignoring ANSI escape codes."""
-        return len(ANSI_REGX.sub('', s))
+        return len(ANSI_RX.sub('', s))
 
     def format_row(row: tuple[str], widths: List[int]):
         """Format a single row (with padding if needed)."""
@@ -214,7 +222,7 @@ def key_event_handler():
         match ch:
             case ' ':
                 PAUSED = not PAUSED
-                eprint('\n' + 'Paused' if PAUSED else 'Resuming...')
+                eprint('\n' + 'Paused - press <space> to resume.' if PAUSED else 'Resuming...')
             case 'q':
                 eprint('\nExiting...')
                 QUITTING = True
@@ -294,38 +302,56 @@ def sort_stats(stats: List[List[str]], key: str | None):
         case 'dev':
             stats.sort(key=lambda x: x[2])
         case 'r_io':
-            stats.sort(key=lambda x: (int(x[4]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (int(ANSI_RX.sub('', x[4])), x[1]), reverse=True)
         case 'w_io':
-            stats.sort(key=lambda x: (int(x[5]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (int(ANSI_RX.sub('', x[5])), x[1]), reverse=True)
         case 'r_mb':
-            stats.sort(key=lambda x: (float(x[6]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (float(ANSI_RX.sub('', x[6])), x[1]), reverse=True)
         case 'w_mb':
-            stats.sort(key=lambda x: (float(x[7]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (float(ANSI_RX.sub('', x[7])), x[1]), reverse=True)
         case 'r_rqm':
-            stats.sort(key=lambda x: (int(x[8]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (int(ANSI_RX.sub('', x[8])), x[1]), reverse=True)
         case 'r_rqm_pct':
             stats.sort(key=lambda x: (float(x[9]), x[1]), reverse=True)
         case 'w_rqm':
-            stats.sort(key=lambda x: (int(x[10]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (int(ANSI_RX.sub('', x[10])), x[1]), reverse=True)
         case 'w_rqm_pct':
             stats.sort(key=lambda x: (float(x[11]), x[1]), reverse=True)
         case 'r_wait':
-            stats.sort(key=lambda x: (float(x[12]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (float(ANSI_RX.sub('', x[12])), x[1]), reverse=True)
         case 'w_wait':
-            stats.sort(key=lambda x: (float(x[13]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (float(ANSI_RX.sub('', x[13])), x[1]), reverse=True)
         case 'r_sz':
             stats.sort(key=lambda x: (float(x[14]), x[1]), reverse=True)
         case 'w_sz':
             stats.sort(key=lambda x: (float(x[15]), x[1]), reverse=True)
         case 'queue':
-            stats.sort(key=lambda x: (float(x[16]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (float(ANSI_RX.sub('', x[16])), x[1]), reverse=True)
         case 'util':
-            stats.sort(key=lambda x: (float(x[17]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (float(ANSI_RX.sub('', x[17])), x[1]), reverse=True)
         case 'total_io':
             # combine read and write IOPS
-            stats.sort(key=lambda x: (int(x[4]) + int(x[5]), x[1]), reverse=True)
+            stats.sort(key=lambda x: (int(ANSI_RX.sub('', x[4])) + int(ANSI_RX.sub('', x[5])),
+                                      x[1]), reverse=True)
         case _:
             return
+
+
+def colorize(text: str, val: float | int, scale = 1.0):
+    """Colorize the text based on the value."""
+    if val == 0:
+        return FAINT(text)
+    if val < 0.5 * scale:
+        return text
+    if val < 25 * scale:
+        return BOLD(text)
+    if val < 50 * scale:
+        return BLU(text)
+    if val < 70 * scale:
+        return MAG(text)
+    if val < 85 * scale:
+        return YEL(text)
+    return RED(text)
 
 
 # pylint: disable=too-many-locals
@@ -368,24 +394,24 @@ def parse_data(mapping: Dict, prev: Dict, now: Dict, delta_t: float, disc: bool)
         util   = 100.0 * io_t / (delta_t * 1000.0) if delta_t > 0 else 0.0
 
         row = [
-            mapping[dev][0],    # Pool name
-            mapping[dev][1],    # RBD name
-            dev,                # /dev/rbdX
-            humanize_size(mapping[dev][2] * 512),  # RBD exposes 512-byte blocks
-            f"{r_s:.0f}",       # read I/O per second
-            f"{w_s:.0f}",
-            f"{r_mb_s:.1f}",    # read MB/s
-            f"{w_mb_s:.1f}",
-            f"{rrqm_s:.0f}",    # read requests merged per second
-            f"{p_rrqm:.2f}",    # read requests merged percentage
-            f"{wrqm_s:.0f}",
+            mapping[dev][0],        # Pool name
+            GRN(mapping[dev][1]),   # RBD name
+            dev,                    # /dev/rbdX
+            humanize_size(mapping[dev][2] * 512),   # RBD exposes 512-byte blocks
+            colorize(f"{r_s:.0f}", r_s, 10),        # read I/O per second
+            colorize(f"{w_s:.0f}", w_s, 10),
+            colorize(f"{r_mb_s:.1f}", r_mb_s),      # read MB/s
+            colorize(f"{w_mb_s:.1f}", w_mb_s),
+            colorize(f"{rrqm_s:.0f}", rrqm_s, 10),  # read requests merged per second
+            f"{p_rrqm:.2f}",                        # read requests merged percentage
+            colorize(f"{wrqm_s:.0f}", wrqm_s, 10),
             f"{p_wrqm:.2f}",
-            f"{r_await:.2f}",   # read await time
-            f"{w_await:.2f}",
-            f"{rareq_sz:.1f}",  # avg read request size
+            colorize(f"{r_await:.1f}", r_await),    # read await time
+            colorize(f"{w_await:.1f}", w_await),
+            f"{rareq_sz:.1f}",                      # avg read request size
             f"{wareq_sz:.1f}",
-            f"{aqu_sz:.1f}",    # average queue size
-            f"{util:.2f}",      # device utilization %
+            colorize(f"{aqu_sz:.1f}", aqu_sz),      # average queue size
+            colorize(f"{util:.2f}", util),          # device utilization %
             ]
 
         if disc:    # add discard statistics if requested
@@ -458,7 +484,7 @@ def main():
             if continuous:
                 clear_terminal()
             sort_stats(data, key=args.sort)
-            print(simple_tabulate(data, headers=HEADERS))
+            print(simple_tabulate(data, headers=tuple(BOLD(h) for h in HEADERS)))
         if not continuous or QUITTING:
             break
 
