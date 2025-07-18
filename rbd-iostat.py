@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.2-1_20250717"
+__version__   = "0.2.3-1_20250718"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -21,8 +21,8 @@ import time
 import tty
 from argparse import ArgumentParser
 from collections import deque
-from re import compile as re_compile
-from typing import Dict, Iterable, List
+from re import compile as re_compile, error as re_error, Pattern
+from typing import Dict, Iterable, List, Optional
 
 PAUSED    = False
 QUITTING  = False
@@ -49,6 +49,8 @@ def parse_cmdline_args():
     args = ArgumentParser(description='RBD I/O statistics monitor')
     args.add_argument('inter', nargs='?', type=float, default=INTERVAL,
                       help='Continuous statistics interval (default: 0.0, i.e., one-shot)')
+    args.add_argument('--pool', '-P', help='Which pool to monitor (default: all)')
+    args.add_argument('--name', '-N', help='Which RBDs to monitor [regex] (default: all)')
     args.add_argument('--hist', '-H', type=int, default=1,
                       help='Statistics history entries to keep (default: 1, min: 1)')
     args.add_argument('--sort', '-S', choices=SORT_FLDS,
@@ -61,6 +63,17 @@ def parse_cmdline_args():
     # validate/adjust arguments
     p.inter = max(0.0, p.inter) # ensure interval is non-negative
     p.hist = max(1, p.hist)     # ensure history is at least 1 entry
+
+    # RBD pool and name filtering
+    if p.pool:
+        global RBD_GLOB
+        p.pool = p.pool.strip().lower()     # normalize pool name
+        RBD_GLOB = RBD_GLOB.replace('*', p.pool, 1)
+    if p.name:
+        try:
+            p.name = re_compile(p.name)  # validate regex
+        except re_error as e:
+            args.error(f'Invalid regex for RBD name: {e}')
 
     if p.discard:   # add discard headers if requested
         global HEADERS
@@ -248,9 +261,9 @@ def key_event_handler():
                 continue
 
 
-def build_mapping():
+def build_mapping(patt: Optional[Pattern]):
     """Build mapping from `rbdX` to `pool/rbd_name`"""
-    mapping: Dict[str, tuple[str, str]] = {}
+    mapping: Dict[str, tuple[str, str]] = {'skipped': set()}
     for link in glob.glob(RBD_GLOB):
         if os.path.islink(link):
             if '-part' in link:  # skip partition links
@@ -261,13 +274,19 @@ def build_mapping():
                 dev = tgt[6:]
                 pool = os.path.basename(os.path.dirname(link))
                 rbd_name = os.path.basename(link)
+
+                # are we filtering by RBD name?
+                if patt and not patt.match(rbd_name):
+                    mapping['skipped'].add(dev)
+                    continue
+
                 blocks = int(read_oneline_file(f'/sys/block/{dev}/size').strip())
                 mapping[dev] = (pool, rbd_name, blocks)
 
     return mapping
 
 
-def read_stats():
+def read_stats(skipped: set[str]):
     """Read I/O statistics from /proc/diskstats for RBD devices."""
     stats: Dict[str, List[int]] = {'num_fields': 0}
     with open(DISKSTATS, encoding='utf-8') as f:
@@ -275,6 +294,9 @@ def read_stats():
             parts = line.split()
             num_fields = len(parts)
             dev = parts[2]
+
+            if dev in skipped or not dev.startswith('rbd'):
+                continue
 
             if stats['num_fields'] == 0:
                 stats['num_fields'] = num_fields
@@ -285,10 +307,9 @@ def read_stats():
             elif num_fields < 14:
                 continue
 
-            if dev.startswith('rbd'):
-                # take the relevant fields
-                stat_values = list(map(int, parts[3:]))
-                stats[dev] = stat_values
+            # take the relevant fields
+            stat_values = list(map(int, parts[3:]))
+            stats[dev] = stat_values
     return stats
 
 
@@ -453,8 +474,8 @@ def main():
     args       = parse_cmdline_args()
     history    = deque(maxlen=args.hist)
     continuous = args.inter > 0
-    rbd_map    = build_mapping()
-    if not rbd_map:
+    rbd_map    = build_mapping(patt=args.name)
+    if len(rbd_map) < 2:    # at least one device + 'skipped' set
         print('No RBD devices found.')
         sys.exit(0)
 
@@ -465,7 +486,7 @@ def main():
 
     while True:
         now   = time.time()
-        stats = read_stats()
+        stats = read_stats(skipped=rbd_map['skipped'])
 
         if len(history) == 0:
             delta_t = float(read_oneline_file('/proc/uptime').split()[0])
