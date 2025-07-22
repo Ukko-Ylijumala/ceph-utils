@@ -6,7 +6,7 @@ osd-rocksdb-reshard.py - A script to reshard RocksDB databases in Ceph OSDs.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.1.0-1_20250722"
+__version__   = "0.1.1-1_20250722"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -24,8 +24,8 @@ DRYRUN    = False  # set to True to enable dry-run mode
 UNIT_BASE = 'ceph-osd@'
 OSD_BASE  = '/var/lib/ceph/osd'
 ERR_NO_SHARDING = 'failed to retrieve sharding def'
-DEFAULT = 'm(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru} \
-    L=min_write_buffer_number_to_merge=32 P=min_write_buffer_number_to_merge=32'
+DEFAULT = """m(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru} \
+L=min_write_buffer_number_to_merge=32 P=min_write_buffer_number_to_merge=32"""
 
 
 def parse_cmdline_args():
@@ -61,6 +61,7 @@ def parse_cmdline_args():
                 bailout(f"'{data_path}' is not a directory")
             elif not os.listdir(data_path):
                 bailout(f"OSD {osd} data directory '{data_path}' is empty")
+    p.osds.sort()
 
     if p.dryrun:
         global DRYRUN
@@ -312,11 +313,11 @@ def reshard(osd_id: int, cluster: str, sharding = DEFAULT) -> None:
     if is_osd_active(osd_id, cluster) and not DRYRUN:
         bailout(f'OSD {osd_id} is active, cannot reshard its RocksDB.')
 
-    INFO(f"resharding OSD {osd_id} RocksDB with '{sharding}'")
+    INFO(f'starting reshard of OSD {osd_id} RocksDB...')
     try:
         osd_path = osd_libpath(osd_id, cluster)
-        run_cmd('ceph-bluestore-tool', ['reshard', '--path', osd_path, '--sharding', sharding])
-        INFO(f'resharding finished for OSD {osd_id}')
+        run_cmd('ceph-bluestore-tool', ['reshard', '--path', osd_path, f'--sharding="{sharding}"'])
+        INFO(f'resharding finished for OSD {osd_id}.')
     except RuntimeError as e:
         bailout(f'failed to reshard OSD {osd_id}: {e}')
 
@@ -325,10 +326,11 @@ def main():
     args = parse_cmdline_args()
     if not (args.yes or args.force):
         WARN(f"this script will reshard OSDs (cluster '{args.cluster}'): {args.osds}")
+        eprint(f'RocksDB sharding conf:\n"{DEFAULT}"')
         eprint(' >>> The operation may take a while and could even cause a loss of OSD(s).')
         eprint(' >>> Each OSD will be stopped, resharded, and restarted in sequence.')
-        eprint(f"(Use '{os.path.basename(__file__)} --yes' to skip this prompt.)")
-        if input(RED('Are you really sure you want to proceed? (y/N): ')).strip().lower() != 'y':
+        eprint(f"     (Use '{os.path.basename(__file__)} --yes' to skip this prompt.)\n")
+        if input(RED('Are you really sure you wish to proceed? (y/N): ')).strip().lower() != 'y':
             bailout('Aborting.', exit_code=0, prepend=False)
 
     for osd in args.osds:
@@ -336,24 +338,24 @@ def main():
         if not DRYRUN:
             INFO(f'stopping OSD {osd}...')
             systemctl_op('stop', osd=osd)
-        wait_till_inactive(osd, args.cluster)
+        wait_till_inactive(osd, cluster=args.cluster)
 
-        sharding_def = get_sharding_def(osd, args.cluster)
+        sharding_def = get_sharding_def(osd, cluster=args.cluster)
         if sharding_def is None:
             INFO(f'OSD {osd} has no RocksDB sharding -> initialize sharding')
             reshard(osd, cluster=args.cluster, sharding=DEFAULT)
         elif args.force:
-            WARN(f'OSD {osd} RocksDB already is sharded, but --force is set: {sharding_def}')
+            WARN(f'OSD {osd} RocksDB already is sharded, but --force is set:\n{sharding_def}')
             reshard(osd, cluster=args.cluster, sharding=DEFAULT)
         else:
-            INFO(f'OSD {osd} already has RocksDB sharding - skipping: {sharding_def}')
+            INFO(f'OSD {osd} already has RocksDB sharding - skipping:\n{sharding_def}')
 
         # restart the OSD service
         if not DRYRUN:
             INFO(f'restarting OSD {osd}...')
             systemctl_op('start', osd=osd)
             INFO(f'waiting for OSD {osd} to become active...')
-            while not is_osd_active(osd, args.cluster):
+            while not is_osd_active(osd, cluster=args.cluster):
                 sleep(1)
             INFO(f'OSD {osd} restarted successfully')
 
