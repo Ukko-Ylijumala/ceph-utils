@@ -15,10 +15,8 @@ import sys
 from argparse import ArgumentParser
 from subprocess import run, CalledProcessError, TimeoutExpired
 from time import time, sleep
-from typing import Dict, Iterable, List, Optional, NoReturn
-from re import compile as re_compile, error as re_error, Pattern
+from typing import List, Optional, NoReturn
 
-ANSI_RX   = re_compile(r'\x1b\[[0-9;]*m')   # matches standard ANSI color escape sequences
 HOSTNAME  = os.uname().nodename
 DRYRUN    = False  # set to True to enable dry-run mode
 UNIT_BASE = 'ceph-osd@'
@@ -122,69 +120,6 @@ def INFO(msg: str):
 def WARN(msg: str):
     """Print a warning message to stderr, with WARN: prepended."""
     eprint(YEL(f'WARN: {msg}'))
-
-
-def simple_tabulate(data: Iterable[Iterable], headers: Iterable = None, missing = '-'):
-    """
-    Format a list of iterables as a table for printing.
-
-    Args:
-        data: List of iterables (lists, tuples) containing the data to display
-        headers: Optional list of column headers
-        missing: String to replace None values with
-
-    Returns:
-        String containing the formatted table
-    """
-    def visible_len(s: str) -> int:
-        """Return the visible length of a string, ignoring ANSI escape codes."""
-        return len(ANSI_RX.sub('', s))
-
-    def format_row(row: tuple[str], widths: List[int]):
-        """Format a single row (with padding if needed)."""
-        items = []
-        for i, item in enumerate(row):
-            vis_len = visible_len(item)
-            pad = ' ' * (widths[i] - vis_len)
-            items.append(item + pad)
-        diff = len(widths) - len(items)
-        if diff > 0:
-            # pad with `missing` value(s) if the row is too short
-            missing_vis_len = visible_len(missing)
-            for j in range(diff):
-                pad = ' ' * (widths[len(items) + j] - missing_vis_len)
-                items.append(missing + pad)
-        return ' | '.join(items)
-
-    all_rows: List[tuple[str]] = []
-    if headers is not None:
-        all_rows.append(tuple(str(h) for h in headers))
-    for row in data:
-        all_rows.append(tuple(str(item) if item is not None else missing for item in row))
-    if not all_rows:
-        return ''
-
-    # Find the maximum width needed for each column (based on visible lengths)
-    columns = 1
-    for row in all_rows:
-        columns = max(len(row), columns)
-    widths = [0] * columns
-    for row in all_rows:
-        for i, item in enumerate(row):
-            widths[i] = max(widths[i], visible_len(item))
-
-    # Format each row with appropriate padding
-    formatted_rows: List[str] = []
-    if headers is not None:
-        # Format headers with a separator line if headers are provided
-        formatted_rows.append(format_row(all_rows[0], widths))
-        separator = '-+-'.join('-' * w for w in widths)
-        formatted_rows.append(separator)
-
-    for row in all_rows[1:] if headers else all_rows:
-        formatted_rows.append(format_row(row, widths))
-
-    return '\n'.join(formatted_rows)
 
 
 def run_cmd(cmd: str, cmd_args: Optional[List[str]] = None, timeout: Optional[int] = None):
