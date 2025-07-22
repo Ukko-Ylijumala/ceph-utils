@@ -6,7 +6,7 @@ osd-rocksdb-reshard.py - A script to reshard RocksDB databases in Ceph OSDs.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.1.1-1_20250722"
+__version__   = "0.1.2-1_20250722"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -108,7 +108,7 @@ def bailout(msg: str, exit_code = 1, prepend = True) -> NoReturn:
         exit_code: The exit code to use (default: 1)
         prepend: If True, prepend the message with 'ERROR: '
     """
-    eprint(f'ERROR: {msg}' if prepend else msg)
+    eprint(f'{RED('ERROR')}: {msg}' if prepend else msg)
     sys.exit(exit_code)
 
 
@@ -154,6 +154,14 @@ def run_cmd(cmd: str, cmd_args: Optional[List[str]] = None, timeout: Optional[in
 def osd_libpath(osd: int, cluster: str):
     """Construct an OSD's data directory path (in /var/lib/ceph)"""
     return os.path.join(OSD_BASE, f'{cluster}-{osd}')
+
+
+def is_ceph_healthy(cluster: str):
+    """Check whether the Ceph cluster is healthy ('HEALTH_OK' status)."""
+    try:
+        return run_cmd('ceph', ['--cluster', cluster, 'health'])[0] == 'HEALTH_OK'
+    except RuntimeError as e:
+        bailout(f'failed to check Ceph health: {e}')
 
 
 def systemctl_op(op: str, osd: int):
@@ -264,11 +272,19 @@ def main():
         eprint(f'RocksDB sharding conf:\n"{DEFAULT}"')
         eprint(' >>> The operation may take a while and could even cause a loss of OSD(s).')
         eprint(' >>> Each OSD will be stopped, resharded, and restarted in sequence.')
-        eprint(f"     (Use '{os.path.basename(__file__)} --yes' to skip this prompt.)\n")
+        eprint(" >>> It is recommended to set 'noout' mode during this process.")
+        eprint(FAINT(f"     (Use '{os.path.basename(__file__)} --yes' to skip this prompt)\n"))
+        WARN('!!! DO NOT RUN THIS SCRIPT ON MULTIPLE OSDs AND/OR HOSTS AT THE SAME TIME !!!\n')
         if input(RED('Are you really sure you wish to proceed? (y/N): ')).strip().lower() != 'y':
             bailout('Aborting.', exit_code=0, prepend=False)
 
     for osd in args.osds:
+        # wait till Ceph cluster is healthy before starting with each OSD
+        if not is_ceph_healthy(args.cluster) and not DRYRUN:
+            INFO(f"waiting for Ceph cluster '{args.cluster}' to become healthy...")
+            while not is_ceph_healthy(args.cluster):
+                sleep(10)
+
         # stop the OSD service
         if not DRYRUN:
             INFO(f'stopping OSD {osd}...')
