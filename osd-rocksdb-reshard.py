@@ -6,7 +6,7 @@ osd-rocksdb-reshard.py - A script to reshard RocksDB databases in Ceph OSDs.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.1.3-3_20250723"
+__version__   = "0.1.3-4_20250723"
 __license__   = "GPL-3.0-or-later"
 
 import errno
@@ -166,10 +166,14 @@ def is_ceph_healthy(cluster: str):
     Also acceptable is `HEALTH_WARN` with `noout` flag (`HEALTH_WARN noout flag(s) set`).
     """
     try:
-        state = run_cmd('ceph', ['--cluster', cluster, 'health', 'detail'])[0]
+        out, _ = run_cmd('ceph', ['--cluster', cluster, 'health', 'detail'])
+        # we only want the 1st line of (possibly multi-line) output
+        state = out.splitlines()[0].strip()
         if state == 'HEALTH_OK':
             return True
-        if state.startswith('HEALTH_WARN') and 'noout flag(s) set' in state:
+        if state == 'HEALTH_WARN noout flag(s) set':
+            # noout flag is set, which is the only case when we allow HEALTH_WARN
+            # this is acceptable, as it means we can still safely bring OSDs down
             return True
         return False
     except RuntimeError as e:
