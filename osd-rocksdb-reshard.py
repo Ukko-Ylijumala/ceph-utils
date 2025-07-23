@@ -6,7 +6,7 @@ osd-rocksdb-reshard.py - A script to reshard RocksDB databases in Ceph OSDs.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.1.3-2_20250723"
+__version__   = "0.1.3-3_20250723"
 __license__   = "GPL-3.0-or-later"
 
 import errno
@@ -135,7 +135,7 @@ def run_cmd(cmd: str, cmd_args: Optional[List[str]] = None,
 
     if DRYRUN:
         # in dry-run mode, just print the command and return bogus output
-        eprint(YEL(f"*** would run: {BOLD(' '.join(full))}"))
+        eprint(YEL('*** would run:'), FAINT(' '.join(full)))
         return 'dryrun', 'dryrun'
 
     try:
@@ -270,11 +270,12 @@ def get_sharding_def(osd_id: int, cluster: str) -> Optional[str]:
 
     try:
         osd_path = osd_libpath(osd_id, cluster)
-        result = run_cmd('ceph-bluestore-tool', ['show-sharding', '--path', osd_path])
-        if ERR_NO_SHARDING in (result[0], result[1]) or DRYRUN:
+        out, err = run_cmd('ceph-bluestore-tool', ['show-sharding', '--path', osd_path])
+        if ERR_NO_SHARDING in (out, err) or DRYRUN:
             # this is a legacy OSD without RocksDB sharding
+            eprint('ceph-bluestore-tool:', FAINT(out))
             return None
-        return result
+        return out
     except RuntimeError as e:
         bailout(f'could not get sharding for OSD {osd_id}: {e}')
 
@@ -294,7 +295,9 @@ def reshard(osd_id: int, cluster: str, sharding = DEFAULT) -> None:
     INFO(f'starting reshard of OSD {osd_id} RocksDB...')
     try:
         osd_path = osd_libpath(osd_id, cluster)
-        run_cmd('ceph-bluestore-tool', ['reshard', '--path', osd_path, f'--sharding="{sharding}"'])
+        out, _ = run_cmd('ceph-bluestore-tool', ['reshard', '--path', osd_path,
+                                                 f'--sharding="{sharding}"'])
+        eprint('ceph-bluestore-tool:', FAINT(out))
         INFO(f'resharding finished for OSD {osd_id}.')
     except RuntimeError as e:
         bailout(f'failed to reshard OSD {osd_id}: {e}')
@@ -304,7 +307,7 @@ def main():
     args = parse_cmdline_args()
     if not (args.yes or args.force):
         WARN(f"this script will reshard OSDs (cluster '{args.cluster}'): {args.osds}")
-        eprint(f'\nRocksDB sharding conf to be applied:\n"{DEFAULT}"\n')
+        eprint('\nRocksDB sharding conf to be applied:\n', FAINT(DEFAULT), '\n')
         eprint(' >>> The operation may take a while and could even cause a loss of OSD(s).')
         eprint(' >>> Each OSD will be stopped, resharded, and restarted in sequence.')
         eprint(" >>> It is recommended to set 'noout' mode during this process.")
