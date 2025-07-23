@@ -6,7 +6,7 @@ osd-rocksdb-reshard.py - A script to reshard RocksDB databases in Ceph OSDs.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.1.3-1_20250722"
+__version__   = "0.1.3-2_20250723"
 __license__   = "GPL-3.0-or-later"
 
 import errno
@@ -124,7 +124,8 @@ def WARN(msg: str):
     eprint(YEL(f'WARN: {msg}'))
 
 
-def run_cmd(cmd: str, cmd_args: Optional[List[str]] = None, timeout: Optional[int] = None):
+def run_cmd(cmd: str, cmd_args: Optional[List[str]] = None,
+            timeout: Optional[int] = None, check = True):
     """Run a command with args with subprocess.run and return the result `(stdout, stderr)`."""
     if not cmd_args:
         cmd_args = []
@@ -138,7 +139,7 @@ def run_cmd(cmd: str, cmd_args: Optional[List[str]] = None, timeout: Optional[in
         return 'dryrun', 'dryrun'
 
     try:
-        res = run(full, capture_output=True, text=True, check=True, timeout=timeout)
+        res = run(full, capture_output=True, text=True, check=check, timeout=timeout)
         # make sure we always return strings
         out = res.stdout.strip() if res.stdout else ''
         err = res.stderr.strip() if res.stderr else ''
@@ -175,24 +176,29 @@ def is_ceph_healthy(cluster: str):
         bailout(f'failed to check Ceph health: {e}')
 
 
-def systemctl_op(op: str, osd: int):
+def systemctl_op(op: str, osd: int, check = True):
     """
     Perform a systemctl operation on a given unit.
 
     Args:
         op: The systemctl operation (e.g., 'start', 'stop', 'restart', 'is-active'...)
-        osd_id: The OSD ID to operate on
+        osd: The OSD ID to operate on
+        check: If True, raise an exception on non-zero exit code
     """
     unit_name = f'{UNIT_BASE}{osd}.service'
     try:
-        return run_cmd('systemctl', [op, unit_name])[0]
+        return run_cmd('systemctl', [op, unit_name], check=check)[0]
     except (RuntimeError, TimeoutError) as e:
         bailout(f"'systemctl {op}' failed for {unit_name}: {e}")
 
 
 def is_osd_active(osd: int, cluster: str):
     """Check if a given OSD (service) is active."""
-    systemd_status_up = systemctl_op('is-active', osd) == 'active'
+    # For some moronic reason, 'systemctl is-active' exits with code=3 if a unit is in 'inactive'
+    # state. We need to disable the exit code check, or it will raise an exception, which is not
+    # what we want (we're checking against the stdout string value instead).
+    # See: https://bugs.freedesktop.org/show_bug.cgi?id=77507
+    systemd_status_up = systemctl_op('is-active', osd, check=False) == 'active'
 
     # We don't fully trust systemd, so we also check an exclusive lock on the OSD's fsid file.
     # This replicates the logic from Ceph to determine if an OSD is already operational.
