@@ -6,9 +6,11 @@ osd-rocksdb-reshard.py - A script to reshard RocksDB databases in Ceph OSDs.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.1.2-1_20250722"
+__version__   = "0.1.3-1_20250722"
 __license__   = "GPL-3.0-or-later"
 
+import errno
+import fcntl
 import glob
 import os
 import sys
@@ -108,7 +110,7 @@ def bailout(msg: str, exit_code = 1, prepend = True) -> NoReturn:
         exit_code: The exit code to use (default: 1)
         prepend: If True, prepend the message with 'ERROR: '
     """
-    eprint(f'{RED('ERROR')}: {msg}' if prepend else msg)
+    eprint(f"{RED('ERROR')}: {msg}" if prepend else msg)
     sys.exit(exit_code)
 
 
@@ -157,9 +159,18 @@ def osd_libpath(osd: int, cluster: str):
 
 
 def is_ceph_healthy(cluster: str):
-    """Check whether the Ceph cluster is healthy ('HEALTH_OK' status)."""
+    """
+    Check whether the Ceph cluster is healthy (`HEALTH_OK` status).
+
+    Also acceptable is `HEALTH_WARN` with `noout` flag (`HEALTH_WARN noout flag(s) set`).
+    """
     try:
-        return run_cmd('ceph', ['--cluster', cluster, 'health'])[0] == 'HEALTH_OK'
+        state = run_cmd('ceph', ['--cluster', cluster, 'health', 'detail'])[0]
+        if state == 'HEALTH_OK':
+            return True
+        if state.startswith('HEALTH_WARN') and 'noout flag(s) set' in state:
+            return True
+        return False
     except RuntimeError as e:
         bailout(f'failed to check Ceph health: {e}')
 
@@ -182,18 +193,36 @@ def systemctl_op(op: str, osd: int):
 def is_osd_active(osd: int, cluster: str):
     """Check if a given OSD (service) is active."""
     systemd_status_up = systemctl_op('is-active', osd) == 'active'
-    # we don't fully trust systemd here, so we also check the admin socket
-    try:
-        with open(f'/var/run/ceph/{cluster}-osd.{osd}.asok', 'r', encoding='utf-8'):
-            # if the socket can be opened, the OSD is likely running
-            if not systemd_status_up:
-                WARN(f'systemd claims OSD {osd} is down, but admin socket exists.')
-            return True
-    except FileNotFoundError:
-        # if the socket file does not exist, the OSD is not running
-        if systemd_status_up:
-            WARN(f'systemd claims OSD {osd} is up, but no admin socket exists.')
-        return False
+
+    # We don't fully trust systemd, so we also check an exclusive lock on the OSD's fsid file.
+    # This replicates the logic from Ceph to determine if an OSD is already operational.
+    fsid_path = os.path.join(osd_libpath(osd, cluster), 'fsid')
+    lock_held = False
+    if os.path.exists(fsid_path):
+        try:
+            fd = open(fsid_path, 'r+', encoding='utf-8')    # we need a writable fd for locking
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # non-blocking exclusive lock
+            fcntl.lockf(fd, fcntl.LOCK_UN)                  # if acquired, release immediately
+            fd.close()
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):    # lock held by another process
+                lock_held = True
+            elif e.errno == errno.EBADF:
+                bailout(f"can't lock {fsid_path}: bad file descriptor (check permissions or mode)")
+            else:
+                raise       # other errors (e.g., EACCES for permissions) should propagate
+        except Exception:   #pylint: disable=broad-except
+            # if any other issue (e.g., file vanished), assume not active but log
+            WARN(f'unexpected error checking fsid lock for OSD {osd}: {e}')
+
+    if lock_held:
+        if not systemd_status_up:
+            WARN(f'systemd claims OSD {osd} is down, but fsid lock is held.')
+        return True
+
+    if systemd_status_up:
+        WARN(f'systemd claims OSD {osd} is up, but no fsid lock is held (inconsistent state).')
+    return False
 
 
 def wait_till_inactive(osd_id: int, cluster: str, timeout = 60):
@@ -269,11 +298,12 @@ def main():
     args = parse_cmdline_args()
     if not (args.yes or args.force):
         WARN(f"this script will reshard OSDs (cluster '{args.cluster}'): {args.osds}")
-        eprint(f'RocksDB sharding conf:\n"{DEFAULT}"')
+        eprint(f'\nRocksDB sharding conf to be applied:\n"{DEFAULT}"\n')
         eprint(' >>> The operation may take a while and could even cause a loss of OSD(s).')
         eprint(' >>> Each OSD will be stopped, resharded, and restarted in sequence.')
         eprint(" >>> It is recommended to set 'noout' mode during this process.")
         eprint(FAINT(f"     (Use '{os.path.basename(__file__)} --yes' to skip this prompt)\n"))
+
         WARN('!!! DO NOT RUN THIS SCRIPT ON MULTIPLE OSDs AND/OR HOSTS AT THE SAME TIME !!!\n')
         if input(RED('Are you really sure you wish to proceed? (y/N): ')).strip().lower() != 'y':
             bailout('Aborting.', exit_code=0, prepend=False)
@@ -291,6 +321,7 @@ def main():
             systemctl_op('stop', osd=osd)
         wait_till_inactive(osd, cluster=args.cluster)
 
+        # what to do about RocksDB sharding?
         sharding_def = get_sharding_def(osd, cluster=args.cluster)
         if sharding_def is None:
             INFO(f'OSD {osd} has no RocksDB sharding -> initialize sharding')
@@ -309,6 +340,7 @@ def main():
             while not is_osd_active(osd, cluster=args.cluster):
                 sleep(1)
             INFO(f'OSD {osd} restarted successfully')
+            sleep(10)  # give some time for OSD to stabilize
 
     INFO('All done.')
 
