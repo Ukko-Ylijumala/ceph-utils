@@ -6,7 +6,7 @@ osd-rocksdb-reshard.py - A script to reshard RocksDB databases in Ceph OSDs.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.1.3-4_20250723"
+__version__   = "0.1.5-1_20250723"
 __license__   = "GPL-3.0-or-later"
 
 import errno
@@ -33,26 +33,41 @@ def parse_cmdline_args():
     args = ArgumentParser(description='OSD RocksDB resharding tool')
     args.add_argument('osds', nargs='*', type=int,
                       help='List of OSD IDs to reshard (default: all OSDs)')
+    args.add_argument('--exclude', '-E', default=set(),
+                      help='Comma-separated list of OSD IDs to exclude (default: none)')
     args.add_argument('--cluster', default='ceph', help='Cluster name (default: ceph)')
     args.add_argument('--timeout', type=int, default=60,
                       help='Timeout for OSD systemctl operations in seconds (default: 60)')
     args.add_argument('--yes', action='store_true', help='Assume yes to all prompts')
-    mode = args.add_mutually_exclusive_group()
-    mode.add_argument('--force', action='store_true',
+    args.add_argument('--fsck', action='store_true', help='Run fsck on each OSD before resharding')
+    MODE = args.add_mutually_exclusive_group()
+    MODE.add_argument('--force', action='store_true',
                       help='Force resharding even if it is not needed')
-    mode.add_argument('--dryrun', action='store_true',
+    MODE.add_argument('--dryrun', action='store_true',
                       help='Do not perform any changes, just show what would be done')
     args.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     p = args.parse_args()
 
+    # validate exclusions and remove duplicates
+    if isinstance(p.exclude, str):
+        if not ',' in p.exclude and not p.exclude.strip().isdigit():
+            bailout(f"invalid exclusion '{p.exclude}': must be a comma-separated list of OSD IDs")
+        # split exclusions string by comma and convert elements to int
+        p.exclude = set(map(int, (i.strip() for i in p.exclude.split(',') if i.strip().isdigit())))
+
     if not p.osds:
-        # if no OSDs are specified, assume all OSDs
+        # if no OSDs are specified, assume all valid OSDs
         p.osds = [int(os.path.basename(d).split('-')[1])
-                  for d in glob.glob(f'{OSD_BASE}/{p.cluster}-*')]
+                  for d in glob.glob(f'{OSD_BASE}/{p.cluster}-*')
+                  if os.path.isdir(d) and
+                     'fsid' in os.listdir(d) and
+                     os.path.isfile(os.path.join(d, 'fsid'))]
         if not p.osds:
             bailout(f'no OSDs found in {OSD_BASE}')
+        p.osds = list(set(p.osds) - p.exclude)
     else:
-        # validate that all specified OSDs exist
+        # validate that all specified OSDs exist and only appear once
+        p.osds = list(set(p.osds) - p.exclude)
         for osd in p.osds:
             data_path = osd_libpath(osd, cluster=p.cluster)
             if not os.path.exists(data_path):
@@ -61,6 +76,10 @@ def parse_cmdline_args():
                 bailout(f"'{data_path}' is not a directory")
             elif not os.listdir(data_path):
                 bailout(f"OSD {osd} data directory '{data_path}' is empty")
+
+    # check and sort OSDs for consistent ordering
+    if not p.osds:
+        bailout('no OSDs left to reshard after exclusion.')
     p.osds.sort()
 
     if p.dryrun:
@@ -145,7 +164,7 @@ def run_cmd(cmd: str, cmd_args: Optional[List[str]] = None,
         err = res.stderr.strip() if res.stderr else ''
         return out, err
     except CalledProcessError as e:
-        err = f"failed to run '{cmd}': {e}"
+        err = f"run_cmd('{cmd}') failed: {e}"
         eprint(RED(err))
         raise RuntimeError(err) from e
     except TimeoutExpired as e:
@@ -250,8 +269,6 @@ def wait_till_inactive(osd_id: int, cluster: str, timeout = 60):
     start_time = time()
     while True:
         if not is_osd_active(osd_id, cluster):
-            elapsed = time() - start_time
-            INFO(f'OSD {osd_id} was shut down after {elapsed:.1f}s')
             break
         if time() - start_time > timeout:
             bailout(f'timeout after {timeout}s waiting for OSD {osd_id} to shut down')
@@ -274,10 +291,14 @@ def get_sharding_def(osd_id: int, cluster: str) -> Optional[str]:
 
     try:
         osd_path = osd_libpath(osd_id, cluster)
-        out, err = run_cmd('ceph-bluestore-tool', ['show-sharding', '--path', osd_path])
+        # have to disable the check here, as 'ceph-bluestore-tool show-sharding' will
+        # return an error code=1 if the OSD is not sharded, which we want to handle
+        # gracefully (return None) instead of raising an exception.
+        out, err = run_cmd('ceph-bluestore-tool',
+                           ['show-sharding', '--path', osd_path], check=False)
         if ERR_NO_SHARDING in (out, err) or DRYRUN:
             # this is a legacy OSD without RocksDB sharding
-            eprint('ceph-bluestore-tool:', FAINT(out))
+            eprint('ceph-bluestore-tool:', FAINT('(no sharding defined)'))
             return None
         return out
     except RuntimeError as e:
@@ -296,15 +317,44 @@ def reshard(osd_id: int, cluster: str, sharding = DEFAULT) -> None:
     if is_osd_active(osd_id, cluster) and not DRYRUN:
         bailout(f'OSD {osd_id} is active, cannot reshard its RocksDB.')
 
-    INFO(f'starting reshard of OSD {osd_id} RocksDB...')
     try:
+        INFO(f'starting reshard of OSD {osd_id} RocksDB...')
         osd_path = osd_libpath(osd_id, cluster)
-        out, _ = run_cmd('ceph-bluestore-tool', ['reshard', '--path', osd_path,
-                                                 f'--sharding="{sharding}"'])
+        out, _ = run_cmd('ceph-bluestore-tool',
+                         ['reshard', '--path', osd_path, f'--sharding="{sharding}"'])
         eprint('ceph-bluestore-tool:', FAINT(out))
-        INFO(f'resharding finished for OSD {osd_id}.')
+        INFO(f'reshard process finished for OSD {osd_id}.')
     except RuntimeError as e:
         bailout(f'failed to reshard OSD {osd_id}: {e}')
+
+
+def fsck(osd_id: int, cluster: str, restart_on_fail: bool) -> List[str]:
+    """
+    Run a 'ceph-bluestore-tool fsck' on a given OSD device. Exits on failure.
+
+    Args:
+        osd_id: The OSD ID to fsck
+        cluster: The name of the Ceph cluster
+        restart_on_fail: If True, attempt to restart the OSD if fsck fails
+    """
+    if is_osd_active(osd_id, cluster) and not DRYRUN:
+        bailout(f'OSD {osd_id} is active, cannot fsck.')
+
+    try:
+        INFO(f'starting fsck of OSD {osd_id}...')
+        osd_path = osd_libpath(osd_id, cluster)
+        out, _ = run_cmd('ceph-bluestore-tool', ['fsck', '--path', osd_path])
+        INFO(f'fsck finished for OSD {osd_id}.')
+        return out.splitlines()
+    except RuntimeError as e:
+        if restart_on_fail:
+            WARN(f'fsck failed for OSD {osd_id}, attempting to restart it...')
+            try:
+                systemctl_op('start', osd=osd_id)
+                INFO(f'OSD {osd_id} restarted successfully after fsck failure.')
+            except RuntimeError as err:
+                bailout(f'failed to restart OSD {osd_id} after fsck failure: {err}')
+        bailout(f'failed to fsck OSD {osd_id}: {e}')
 
 
 def main():
@@ -321,7 +371,9 @@ def main():
         if input(RED('Are you really sure you wish to proceed? (y/N): ')).strip().lower() != 'y':
             bailout('Aborting.', exit_code=0, prepend=False)
 
-    for osd in args.osds:
+    for i, osd in enumerate(args.osds, start=1):
+        eprint(YEL(f'\n[{i}/{len(args.osds)}] Processing OSD {osd} ####################'))
+
         # wait till Ceph cluster is healthy before starting with each OSD
         if not is_ceph_healthy(args.cluster) and not DRYRUN:
             INFO(f"waiting for Ceph cluster '{args.cluster}' to become healthy...")
@@ -329,21 +381,31 @@ def main():
                 sleep(10)
 
         # stop the OSD service
+        start = time()
         if not DRYRUN:
             INFO(f'stopping OSD {osd}...')
             systemctl_op('stop', osd=osd)
-        wait_till_inactive(osd, cluster=args.cluster)
+        wait_till_inactive(osd, cluster=args.cluster, timeout=args.timeout)
+        elapsed = time() - start
+        INFO(f'OSD {osd} was shut down in {elapsed:.2f}s')
+
+        # run fsck if requested
+        if args.fsck:
+            fsck_out = fsck(osd, cluster=args.cluster, restart_on_fail=True)
+            if fsck_out:
+                eprint('fsck output:', FAINT('\n'.join(fsck_out)))
 
         # what to do about RocksDB sharding?
-        sharding_def = get_sharding_def(osd, cluster=args.cluster)
-        if sharding_def is None:
+        INFO(f'checking RocksDB sharding for OSD {osd}...')
+        cur_def = get_sharding_def(osd, cluster=args.cluster)
+        if cur_def is None:
             INFO(f'OSD {osd} has no RocksDB sharding -> initialize sharding')
             reshard(osd, cluster=args.cluster, sharding=DEFAULT)
         elif args.force:
-            WARN(f'OSD {osd} RocksDB already is sharded, but --force is set:\n{sharding_def}')
+            WARN(f'OSD {osd} RocksDB is sharded, but --force is set\n  >>> sharding={cur_def}')
             reshard(osd, cluster=args.cluster, sharding=DEFAULT)
         else:
-            INFO(f'OSD {osd} already has RocksDB sharding - skipping:\n{sharding_def}')
+            INFO(f'OSD {osd} already has RocksDB sharding -> skipping\n  >>> sharding={cur_def}')
 
         # restart the OSD service
         if not DRYRUN:
@@ -353,6 +415,10 @@ def main():
             while not is_osd_active(osd, cluster=args.cluster):
                 sleep(1)
             INFO(f'OSD {osd} restarted successfully')
+
+        total = time() - start
+        eprint(YEL(f'[{i}/{len(args.osds)}] OSD {osd} reshard finished in {total:.0f}s'))
+        if not DRYRUN:
             sleep(10)  # give some time for OSD to stabilize
 
     INFO('All done.')
