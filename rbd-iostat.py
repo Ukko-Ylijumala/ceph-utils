@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.3-1_20250718"
+__version__   = "0.2.3-2_20250724"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -53,7 +53,7 @@ def parse_cmdline_args():
     args.add_argument('--name', '-N', help='Which RBDs to monitor [regex] (default: all)')
     args.add_argument('--hist', '-H', type=int, default=1,
                       help='Statistics history entries to keep (default: 1, min: 1)')
-    args.add_argument('--sort', '-S', choices=SORT_FLDS,
+    args.add_argument('--sort', choices=SORT_FLDS,
                       help='Which column to sort by (default: RBD name / pool name)')
     args.add_argument('--discard', '-D', action='store_true',
                       help='Include discard statistics in the output')
