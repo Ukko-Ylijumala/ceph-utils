@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.5-1_20250724"
+__version__   = "0.2.6-1_20250725"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -316,8 +316,10 @@ def parse_cmdline_args():
                       help='Statistics history entries to keep (default: 1, min: 1)')
     args.add_argument('--sort', choices=tuple(f[0] for f in FIELDS.items() if not f[1]['xtra']),
                       help='Which column to sort by (default: RBD name / pool name)')
-    args.add_argument('--extra', '-x', action='store_true',
+    args.add_argument('--extra', '-x', action='store_true', dest='xtra',
                       help='Include extended (discard/flush) statistics in the output')
+    args.add_argument('--totals', '-T', action='store_true', dest='aggr',
+                      help='Include combined statistics (IOPS, MB/s etc) in the output')
     args.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     p = args.parse_args()
 
@@ -635,11 +637,11 @@ def colorize(text: str, val: float | int, scale = 1.0):
 
 
 def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
-               now: Dict[str, DiskStatRow], xtra: bool,
-               sort_key: Optional[str] = None):
+               now: Dict[str, DiskStatRow], xtra: bool, aggr: bool, sort_key: Optional[str]):
     """
     Parse the current statistics data to compute I/O rates. Also returns a list of
-    raw values for selected sorting column, if required.
+    raw values for selected sorting column, if required. Aggregates certain fields
+    into totals if requested as well.
     """
     def colorize_row(field: str, precision: int) -> str:
         """Helper for colorizing a row based on the field and its value."""
@@ -648,6 +650,13 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
 
     data: List[str] = []
     shadow: List[float] = []
+    totals: List[Optional[str]] = None
+    tmp = None
+    if aggr:
+        tmp = {'r_io': 0.0, 'w_io': 0.0, 'r_mb': 0.0, 'w_mb': 0.0, 'r_rqm': 0.0, 'w_rqm': 0.0,
+               'd_io': 0.0, 'd_mb': 0.0, 'd_rqm': 0.0, 'f_io': 0.0, 'size': 0,
+               'queue': 0.0, 'util': 0.0, 'n_queue': 0, 'n_util': 0}
+
     for dev in sorted(mapping.keys()):
         if dev not in now:
             continue
@@ -674,6 +683,22 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
             colorize_row('util', 2),
             ]
 
+        if aggr:  # add current RBD to the aggregate totals
+            tmp['size']  += mapping[dev].size
+            tmp['r_io']  += delta['r_io']
+            tmp['w_io']  += delta['w_io']
+            tmp['r_mb']  += delta['r_mb']
+            tmp['w_mb']  += delta['w_mb']
+            tmp['r_rqm'] += delta['r_rqm']
+            tmp['w_rqm'] += delta['w_rqm']
+            # weighted average aqu-sz and %util
+            if delta['queue'] > 0:
+                tmp['n_queue'] += 1
+                tmp['queue'] += delta['queue']
+            if delta['util'] > 0:
+                tmp['n_util'] += 1
+                tmp['util']  += delta['util']
+
         if xtra:    # add discard+flush statistics if requested
             row.extend([
                 f"{delta['d_io']:.0f}",
@@ -685,6 +710,12 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
                 f"{delta['f_io']:.0f}",
                 f"{delta['f_wait']:.2f}",
                 ])
+
+            if aggr:
+                tmp['d_io']  += delta['d_io']
+                tmp['d_mb']  += delta['d_mb']
+                tmp['d_rqm'] += delta['d_rqm']
+                tmp['f_io']  += delta['f_io']
 
         data.append(row)
         if sort_key:
@@ -702,7 +733,21 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
                 case _:
                     shadow.append(delta[sort_key])
 
-    return data, shadow
+        if aggr:
+            # avoid division by zero with aqu-sz and %util
+            n_qu, n_ut  = max(1, tmp['n_queue']), max(1, tmp['n_util'])
+            totals = [None, 'ALL RBDs', None, humanize_size(tmp['size']),
+                      f"{tmp['r_io']:.0f}", f"{tmp['w_io']:.0f}",
+                      f"{tmp['r_mb']:.1f}", f"{tmp['w_mb']:.1f}",
+                      f"{tmp['r_rqm']:.0f}", None, f"{tmp['w_rqm']:.0f}",
+                      None, None, None, None, None,
+                      f"{tmp['queue']/n_qu:.1f}", f"{tmp['util']/n_ut:.2f}"]
+            if xtra:
+                totals.extend([f"{tmp['d_io']:.0f}", f"{tmp['d_mb']:.1f}",
+                               f"{tmp['d_rqm']:.0f}", None, None, None,
+                               f"{tmp['f_io']:.0f}", None])
+
+    return data, shadow, totals
 
 
 def main():
@@ -720,7 +765,7 @@ def main():
         listener_t.start()
 
     history: deque[Dict[str, DiskStatRow]] = deque(maxlen=args.hist)
-    if args.extra:
+    if args.xtra:
         headers = tuple(f['dsc'] for f in FIELDS.values() if f['ord'] >= 0)
     else:
         headers = tuple(f['dsc'] for f in FIELDS.values() if f['ord'] >= 0 and not f['xtra'])
@@ -742,12 +787,15 @@ def main():
 
         # parse & display the data
         if not PAUSED:
-            data, shadow = parse_data(rbd_map, prev=prev_stats, now=stats,
-                                      xtra=args.extra, sort_key=args.sort)
+            data, shadow, aggr = parse_data(rbd_map, prev=prev_stats, now=stats,
+                                            xtra=args.xtra, aggr=args.aggr, sort_key=args.sort)
             if continuous:
                 clear_terminal()
 
             sort_stats(data, key=args.sort, values=shadow)
+            # add totals row if requested as the first row after sorting
+            if args.aggr:
+                data.insert(0, aggr)
             print(simple_tabulate(data, headers=tuple(BOLD(h) for h in headers)))
 
         # exit here if we are not in continuous mode or if quitting
