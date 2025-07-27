@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.7-2_20250727"
+__version__   = "0.2.8-1_20250727"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -25,8 +25,7 @@ from enum import Enum, IntEnum
 from re import compile as re_compile, error as re_error, Pattern
 from typing import Dict, Iterable, List, Optional, Set
 
-PAUSED    = False
-QUITTING  = False
+PAUSED = QUITTING = HIDE = False
 MY_NAME   = os.path.basename(__file__)
 TERM_ATTR = termios.tcgetattr(sys.stdin.fileno())
 INTERVAL  = 0.0
@@ -365,6 +364,8 @@ def parse_cmdline_args():
                       help='Include extended (discard/flush) statistics in the output')
     args.add_argument('--totals', '-T', action='store_true', dest='aggr',
                       help='Include combined statistics (IOPS, MB/s etc) in the output')
+    args.add_argument('--nozero', '-Z', action='store_true', dest='hide',
+                      help='Hide RBDs with no activity in the output')
     args.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     p = args.parse_args()
 
@@ -383,6 +384,10 @@ def parse_cmdline_args():
             p.name = re_compile(p.name)  # validate regex
         except re_error as e:
             args.error(f'Invalid regex for RBD name: {e}')
+
+    if p.hide:
+        global HIDE
+        HIDE = True
 
     return p
 
@@ -535,14 +540,14 @@ def getch():
 
 def key_event_handler():
     """Listen for key presses to control program flow."""
-    global PAUSED, QUITTING, INTERVAL
+    global PAUSED, QUITTING, INTERVAL, HIDE
     int_step = 0.5  # interval adjustment step
     while True:
         ch = getch()
         match ch:
             case ' ':
                 PAUSED = not PAUSED
-                eprint('\n' + 'Paused - press <space> to resume.' if PAUSED else 'Resuming...')
+                eprint('\nPaused - press <space> to resume' if PAUSED else 'Resuming...')
             case 'q':
                 eprint('\nExiting...')
                 QUITTING = True
@@ -550,15 +555,19 @@ def key_event_handler():
             case '+':
                 if INTERVAL <= 9.5:  # limit max interval to 10 seconds
                     INTERVAL += int_step
-                    eprint(f'\nInterval increased to {INTERVAL:.1f} seconds.')
+                    eprint(f'*** Interval increased to {INTERVAL:.1f} seconds')
             case '-':
                 if INTERVAL >= 1:   # limit min interval to 1 seconds
                     INTERVAL -= int_step
-                    eprint(f'\nInterval decreased to {INTERVAL:.1f} seconds.')
+                    eprint(f'*** Interval decreased to {INTERVAL:.1f} seconds')
+            case 'z':
+                HIDE = not HIDE
+                eprint('*** Hiding RBDs with no activity' if HIDE else '*** Showing all RBDs...')
             case 'h':
                 PAUSED = True
                 eprint(f"\n{MY_NAME} - Press 'q' to exit, '<space>' to pause/resume,",
-                       f"'+' / '-' to incr/decr display interval by {int_step} s.")
+                       f"'+'/'-' to incr/decr display interval (0.5s < ±{int_step} < 10s),",
+                       "'z' to toggle hiding RBDs with no activity'")
             case '\x03':    # handle Ctrl+C gracefully, otherwise terminal may be garbled
                 eprint('\nInterrupted (listener thread)...')
                 restore_terminal()
@@ -691,7 +700,7 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
     """
     Parse the current statistics data to compute I/O rates. Also returns a list of
     raw values for selected sorting column, if required. Aggregates certain fields
-    into totals if requested as well.
+    into totals if requested as well. Skips RBDs with no activity if `HIDE` is True.
     """
     def fmt_cell(field: OutputField, precision: int) -> str:
         """Helper for colorizing a cell based on the field and its value."""
@@ -712,6 +721,9 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
             continue
 
         delta = DiskStatDelta(prev=prev[dev], now=now[dev])
+        if HIDE and (delta.rd_c + delta.wr_c + delta.disc_c + delta.flush_c) == 0:
+            continue
+
         row = [
             mapping[dev].pool,          # Pool name
             GRN(mapping[dev].image),    # RBD name
