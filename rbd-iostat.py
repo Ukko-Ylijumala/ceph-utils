@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.9-1_20250727"
+__version__   = "0.3.0-1_20250727"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -363,8 +363,18 @@ class SharedState:
         if self.xtra:
             h.extend([f.value.header for f in OutputField if f.value.xtra])
         self._clean_headers = h
-        self._sort: OutputField = args.sort
+        self._sort: OutputField = args.sort or OutputField.RBD  # default sort by RBD name
         self._update_headers()
+        self.sortables = (      # sortable fields in the order we want to cycle through
+            OutputField.POOL,   OutputField.RBD,     OutputField.DEV,    OutputField.SIZE,
+            OutputField.SUM_IO, OutputField.R_IOPS,  OutputField.W_IOPS,
+            OutputField.SUM_MB, OutputField.R_MBPS,  OutputField.W_MBPS,
+            OutputField.R_RQM,  OutputField.R_RQM_P,
+            OutputField.W_RQM,  OutputField.W_RQM_P,
+            OutputField.R_WAIT, OutputField.W_WAIT,
+            OutputField.R_SIZE, OutputField.W_SIZE,
+            OutputField.QUEUE,  OutputField.UTIL)
+        self.sort_index = self.sortables.index(self._sort)  # index of initial sort field
 
     @property
     def continuous(self) -> bool:
@@ -397,7 +407,7 @@ class SharedState:
             self._update_headers()
 
     def _update_headers(self):
-        """Internal non-locking method to update headers. Only call with the lock held."""
+        """Internal non-locking method. Only call with lock held outside of `__init__`"""
         h = self._clean_headers.copy()  # start from clean base
         # highlight (invert) the column(s) we are sorting by
         match self._sort:
@@ -604,6 +614,20 @@ def key_event_handler(s: SharedState):
     int_step = 0.5  # interval adjustment step
     while True:
         ch = getch()
+        if ch == '\x1b':            # escape sequence start
+            ch = getch()            # should be '['
+            if ch == '[':
+                ch = getch()        # direction: 'D' left, 'C' right
+                if ch == 'D':       # left: prev
+                    s.sort_index = (s.sort_index - 1) % len(s.sortables)
+                    s.sort = s.sortables[s.sort_index]
+                    eprint(f"*** Sorting by '{s.sort.name.lower()}' (prev)")
+                elif ch == 'C':     # right: next
+                    s.sort_index = (s.sort_index + 1) % len(s.sortables)
+                    s.sort = s.sortables[s.sort_index]
+                    eprint(f"*** Sorting by '{s.sort.name.lower()}' (next)")
+            continue
+
         match ch:
             case ' ':
                 s.paused = not s.paused
@@ -627,7 +651,7 @@ def key_event_handler(s: SharedState):
                 s.paused = True
                 eprint(f"\n{MY_NAME} - 'q' to exit, '<space>' to pause/resume,",
                        f"'+'/'-' to incr/decr display interval (0.5s < ±{int_step} < 10s),",
-                       "'z' to show/hide inactive RBDs")
+                       "'z' to show/hide inactive RBDs, \u2190/\u2192 to change sort column")
             case '\x03':    # handle Ctrl+C gracefully, otherwise terminal may be garbled
                 eprint('\nInterrupted (listener thread)...')
                 restore_terminal()
