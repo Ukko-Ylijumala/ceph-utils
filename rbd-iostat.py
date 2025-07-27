@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.7-1_20250727"
+__version__   = "0.2.7-2_20250727"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -509,9 +509,11 @@ def humanize_size(size: int) -> str:
 
 
 def clear_terminal():
-    """Clear the terminal screen if stdout is a terminal."""
+    """Clear the terminal screen if stdout is a terminal. Return current rows/cols."""
     if sys.stdout.isatty():
-        os.system('clear' if os.name == 'posix' else 'cls')
+        os.system('clear')
+    termsize = os.get_terminal_size(sys.stdout.fileno())
+    return termsize.columns, termsize.lines
 
 
 def restore_terminal():
@@ -813,6 +815,8 @@ def main():
     else:
         headers = [f.value.header for f in OutputField if not (f.value.xtra or f.value.virt)]
 
+    termsize = os.get_terminal_size(sys.stdout.fileno())
+    cols, rows = termsize.columns, termsize.lines
     while True:
         stats = read_stats(rbd_map, skipped=skip)
 
@@ -833,12 +837,13 @@ def main():
             data, shadow, aggr = parse_data(rbd_map, prev=prev_stats, now=stats,
                                             xtra=args.xtra, aggr=args.aggr, key=args.sort)
             if continuous:
-                clear_terminal()
+                cols, rows = clear_terminal()
 
             sort_stats(data, key=args.sort, values=shadow)
-            # add totals row if requested as the first row after sorting
-            if args.aggr:
+            if args.aggr:               # add totals row if requested as the first row
                 data.insert(0, aggr)
+            if len(data) > rows - 3:    # truncate data to fit the terminal size if needed
+                data = data[:rows-3]
             print(simple_tabulate(data, headers=headers))
 
         # exit here if we are not in continuous mode or if quitting
