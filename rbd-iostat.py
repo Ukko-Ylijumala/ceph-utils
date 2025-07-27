@@ -9,26 +9,24 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.8-2_20250727"
+__version__   = "0.2.9-1_20250727"
 __license__   = "GPL-3.0-or-later"
 
 import glob
 import os
 import sys
 import termios
-import threading
 import time
 import tty
 from argparse import ArgumentParser
 from collections import deque
 from enum import Enum, IntEnum
 from re import compile as re_compile, error as re_error, Pattern
+from threading import Lock, Thread
 from typing import Dict, Iterable, List, Optional, Set
 
-PAUSED = QUITTING = HIDE = False
 MY_NAME   = os.path.basename(__file__)
 TERM_ATTR = termios.tcgetattr(sys.stdin.fileno())
-INTERVAL  = 0.0
 ANSI_RX   = re_compile(r'\x1b\[[0-9;]*m')   # matches standard ANSI color escape sequences
 DISKSTATS = '/proc/diskstats'
 RBD_GLOB  = '/dev/rbd/*/*'
@@ -349,10 +347,77 @@ class DiskStatDelta:
         return ret
 
 
+class SharedState:
+    """Shared program state for threading."""
+    def __init__(self, args):
+        self._lock = Lock()
+        self.hide: bool = args.hide
+        self.aggr: bool = args.aggr
+        self.xtra: bool = args.xtra
+        self.inter: float = args.inter
+        self.paused = False
+        self.quitting = False
+
+        # build the headers for the output table
+        h = [f.value.header for f in OutputField if not (f.value.xtra or f.value.virt)]
+        if self.xtra:
+            h.extend([f.value.header for f in OutputField if f.value.xtra])
+        self._clean_headers = h
+        self._sort: OutputField = args.sort
+        self._update_headers()
+
+    @property
+    def continuous(self) -> bool:
+        """Whether the script is running in continuous mode (interval > 0)."""
+        return self.inter > 0.0
+
+    @property
+    def headers(self) -> List[str]:
+        """The current headers (with sort column highlighted)."""
+        with self._lock:
+            return self._headers
+
+    @property
+    def sort(self) -> OutputField:
+        """The current sorting column."""
+        with self._lock:
+            return self._sort
+
+    @sort.setter
+    def sort(self, sort: OutputField):
+        with self._lock:
+            if self._sort == sort:
+                return
+            self._sort = sort
+            self._update_headers()  # update headers when sort changes
+
+    def update_headers(self):
+        """Update the headers based on the current sorting column."""
+        with self._lock:
+            self._update_headers()
+
+    def _update_headers(self):
+        """Internal non-locking method to update headers. Only call with the lock held."""
+        h = self._clean_headers.copy()  # start from clean base
+        # highlight (invert) the column(s) we are sorting by
+        match self._sort:
+            case None | OutputField.RBD:
+                h[OutputField.RBD.value.pos] = INV(h[OutputField.RBD.value.pos])
+            case OutputField.SUM_IO:
+                h[OutputField.R_IOPS.value.pos] = INV(h[OutputField.R_IOPS.value.pos])
+                h[OutputField.W_IOPS.value.pos] = INV(h[OutputField.W_IOPS.value.pos])
+            case OutputField.SUM_MB:
+                h[OutputField.R_MBPS.value.pos] = INV(h[OutputField.R_MBPS.value.pos])
+                h[OutputField.W_MBPS.value.pos] = INV(h[OutputField.W_MBPS.value.pos])
+            case _:
+                h[self._sort.value.pos] = INV(h[self._sort.value.pos])
+        self._headers = h
+
+
 def parse_cmdline_args():
     """Parse command-line arguments."""
     args = ArgumentParser(description='RBD I/O statistics monitor')
-    args.add_argument('inter', nargs='?', type=float, default=INTERVAL,
+    args.add_argument('inter', nargs='?', type=float, default=0.0,
                       help='Continuous statistics interval (default: 0, i.e., one-shot)')
     args.add_argument('--pool', '-P', help='Which pool to monitor (default: all)')
     args.add_argument('--name', '-N', help='Which RBDs to monitor [regex] (default: all)')
@@ -384,10 +449,6 @@ def parse_cmdline_args():
             p.name = re_compile(p.name)  # validate regex
         except re_error as e:
             args.error(f'Invalid regex for RBD name: {e}')
-
-    if p.hide:
-        global HIDE
-        HIDE = True
 
     return p
 
@@ -538,40 +599,39 @@ def getch():
     return ch
 
 
-def key_event_handler():
+def key_event_handler(s: SharedState):
     """Listen for key presses to control program flow."""
-    global PAUSED, QUITTING, INTERVAL, HIDE
     int_step = 0.5  # interval adjustment step
     while True:
         ch = getch()
         match ch:
             case ' ':
-                PAUSED = not PAUSED
-                eprint('\nPaused - press <space> to resume' if PAUSED else 'Resuming...')
+                s.paused = not s.paused
+                eprint('Paused - press <space> to resume' if s.paused else 'Resuming...')
             case 'q':
                 eprint('\nExiting...')
-                QUITTING = True
+                s.quitting = True
                 break
             case '+':
-                if INTERVAL <= 9.5:  # limit max interval to 10 seconds
-                    INTERVAL += int_step
-                    eprint(f'*** Interval increased to {INTERVAL:.1f} seconds')
+                if s.inter <= 9.5:  # limit max interval to 10 seconds
+                    s.inter += int_step
+                    eprint(f'*** Interval increased to {s.inter:.1f} seconds')
             case '-':
-                if INTERVAL >= 1:   # limit min interval to 1 seconds
-                    INTERVAL -= int_step
-                    eprint(f'*** Interval decreased to {INTERVAL:.1f} seconds')
+                if s.inter >= 1:   # limit min interval to 1 seconds
+                    s.inter -= int_step
+                    eprint(f'*** Interval decreased to {s.inter:.1f} seconds')
             case 'z':
-                HIDE = not HIDE
-                eprint('*** Hiding RBDs with no activity' if HIDE else '*** Showing all RBDs...')
+                s.hide = not s.hide
+                eprint('*** Hiding RBDs with no activity' if s.hide else '*** Showing all RBDs...')
             case 'h':
-                PAUSED = True
-                eprint(f"\n{MY_NAME} - Press 'q' to exit, '<space>' to pause/resume,",
+                s.paused = True
+                eprint(f"\n{MY_NAME} - 'q' to exit, '<space>' to pause/resume,",
                        f"'+'/'-' to incr/decr display interval (0.5s < ±{int_step} < 10s),",
-                       "'z' to toggle hiding RBDs with no activity'")
+                       "'z' to show/hide inactive RBDs")
             case '\x03':    # handle Ctrl+C gracefully, otherwise terminal may be garbled
                 eprint('\nInterrupted (listener thread)...')
                 restore_terminal()
-                QUITTING = True
+                s.quitting = True
                 break
             case _:         # ignore other keys
                 continue
@@ -671,11 +731,11 @@ def colorize(text: str, val: float | int, scale = 1.0):
 
 
 def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
-               now: Dict[str, DiskStatRow], xtra: bool, aggr: bool, key: Optional[OutputField]):
+               now: Dict[str, DiskStatRow], state: SharedState,):
     """
     Parse the current statistics data to compute I/O rates. Also returns a list of
     raw values for selected sorting column, if required. Aggregates certain fields
-    into totals if requested as well. Skips RBDs with no activity if `HIDE` is True.
+    into totals if requested as well. Skips RBDs with no activity if `state.hide` is True.
     """
     def fmt_cell(field: OutputField, precision: int) -> str:
         """Helper for colorizing a cell based on the field and its value."""
@@ -684,9 +744,9 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
 
     data: List[str] = []
     shadow: List[float] = []
-    totals: List[Optional[str]] = None
+    totals: Optional[List[Optional[str]]] = None
     tmp = None
-    if aggr:
+    if state.aggr:
         tmp = {'r_io': 0.0, 'w_io': 0.0, 'r_mb': 0.0, 'w_mb': 0.0, 'r_rqm': 0.0, 'w_rqm': 0.0,
                'd_io': 0.0, 'd_mb': 0.0, 'd_rqm': 0.0, 'f_io': 0.0, 'size': 0,
                'queue': 0.0, 'util': 0.0, 'n_queue': 0, 'n_util': 0}
@@ -696,7 +756,7 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
             continue
 
         delta = DiskStatDelta(prev=prev[dev], now=now[dev])
-        if HIDE and (delta.rd_c + delta.wr_c + delta.disc_c + delta.flush_c) == 0:
+        if state.hide and (delta.rd_c + delta.wr_c + delta.disc_c + delta.flush_c) == 0:
             continue
 
         row = [
@@ -713,7 +773,7 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
             fmt_cell(OutputField.QUEUE, 1),  fmt_cell(OutputField.UTIL, 2),
             ]
 
-        if aggr:  # add current RBD to the aggregate totals
+        if state.aggr:  # add current RBD to the aggregate totals
             tmp['size']  += mapping[dev].size
             tmp['r_io']  += delta[OutputField.R_IOPS]
             tmp['w_io']  += delta[OutputField.W_IOPS]
@@ -729,7 +789,7 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
                 tmp['n_util'] += 1
                 tmp['util']  += delta[OutputField.UTIL]
 
-        if xtra:    # add discard+flush statistics if requested
+        if state.xtra:    # add discard+flush statistics if requested
             row.extend([
                 f"{delta[OutputField.D_IOPS]:.0f}",
                 f"{delta[OutputField.D_MBPS]:.1f}",
@@ -741,17 +801,17 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
                 f"{delta[OutputField.F_WAIT]:.2f}",
                 ])
 
-            if aggr:
+            if state.aggr:
                 tmp['d_io']  += delta[OutputField.D_IOPS]
                 tmp['d_mb']  += delta[OutputField.D_MBPS]
                 tmp['d_rqm'] += delta[OutputField.D_RQM]
                 tmp['f_io']  += delta[OutputField.F_IOPS]
 
         data.append(row)
-        if key:
+        if state.sort:
             # if sorting is requested, we want to keep the actual values of that column around
             # virtual sort keys also need special handling, as they have no column in the output
-            match key:
+            match state.sort:
                 case OutputField.RBD | OutputField.POOL | OutputField.DEV:
                     pass    # strings require no shadowing
                 case OutputField.SIZE:
@@ -763,9 +823,9 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
                     shadow.append(delta[OutputField.R_MBPS] + delta[OutputField.W_MBPS] +
                                   delta[OutputField.D_MBPS])
                 case _:
-                    shadow.append(delta[key])
+                    shadow.append(delta[state.sort])
 
-        if aggr:
+        if state.aggr:
             # avoid division by zero with aqu-sz and %util
             n_qu, n_ut  = max(1, tmp['n_queue']), max(1, tmp['n_util'])
             totals = [None, 'ALL RBDs', None, humanize_size(tmp['size']),
@@ -774,7 +834,7 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
                       f"{tmp['r_rqm']:.0f}", None, f"{tmp['w_rqm']:.0f}",
                       None, None, None, None, None,
                       f"{tmp['queue']/n_qu:.1f}", f"{tmp['util']/n_ut:.2f}"]
-            if xtra:
+            if state.xtra:
                 totals.extend([f"{tmp['d_io']:.0f}", f"{tmp['d_mb']:.1f}",
                                f"{tmp['d_rqm']:.0f}", None, None, None,
                                f"{tmp['f_io']:.0f}", None])
@@ -782,46 +842,20 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
     return data, shadow, totals
 
 
-def update_headers(args, h: List[str]):
-    """Highlight the column we are sorting by in the header line."""
-    # clean up old ANSI codes from the headers
-    h[:] = [ANSI_RX.sub('', col) for col in h]
-
-    # highlight (invert) the column we are sorting by
-    match args.sort:
-        case None | OutputField.RBD:
-            h[OutputField.RBD.value.pos] = INV(h[OutputField.RBD.value.pos])
-        case OutputField.SUM_IO:
-            h[OutputField.R_IOPS.value.pos] = INV(h[OutputField.R_IOPS.value.pos])
-            h[OutputField.W_IOPS.value.pos] = INV(h[OutputField.W_IOPS.value.pos])
-        case OutputField.SUM_MB:
-            h[OutputField.R_MBPS.value.pos] = INV(h[OutputField.R_MBPS.value.pos])
-            h[OutputField.W_MBPS.value.pos] = INV(h[OutputField.W_MBPS.value.pos])
-        case _:
-            h[args.sort.value.pos] = INV(h[args.sort.value.pos])
-
-
 def main():
-    args       = parse_cmdline_args()
-    continuous = args.inter > 0
+    args = parse_cmdline_args()
     rbd_map, skip = build_mapping(patt=args.name)
     if not rbd_map:
         print('No mapped Rados Block Devices found.')
         sys.exit(0)
 
-    if continuous:
-        global INTERVAL
-        INTERVAL = args.inter
-        listener_t = threading.Thread(target=key_event_handler, daemon=True)
+    # set up shared state and threading for the program (incl. header highlighting)
+    state = SharedState(args)
+    if state.continuous:
+        listener_t = Thread(target=key_event_handler, args=(state,), daemon=True)
         listener_t.start()
 
-    # build the headers for the output table
-    headers = [f.value.header for f in OutputField if not (f.value.xtra or f.value.virt)]
-    if args.xtra:
-        headers.extend([f.value.header for f in OutputField if f.value.xtra])
-
-    # set up header highlighting, history and terminal size
-    update_headers(args, h=headers)
+    # set up history and terminal size
     history: deque[Dict[str, DiskStatRow]] = deque(maxlen=args.hist)
     termsize = os.get_terminal_size(sys.stdout.fileno())
     _, rows = termsize.columns, termsize.lines
@@ -836,27 +870,26 @@ def main():
                                            fields=['0', '0', dev] + ['0'] * len(DiskStatField),
                                            ts=prev_time)
                           for dev in stats}
-            if continuous:
+            if state.continuous:
                 history.append(prev_stats)
         else:
             prev_stats = history[-1]
 
         # parse & display the data
-        if not PAUSED:
-            data, shadow, aggr = parse_data(rbd_map, prev=prev_stats, now=stats,
-                                            xtra=args.xtra, aggr=args.aggr, key=args.sort)
-            if continuous:
+        if not state.paused:
+            data, shadow, totals = parse_data(rbd_map, prev=prev_stats, now=stats, state=state)
+            if state.continuous:
                 _, rows = clear_terminal()
 
-            sort_stats(data, key=args.sort, values=shadow)
-            if args.aggr:               # add totals row if requested as the first row
-                data.insert(0, aggr)
+            sort_stats(data, key=state.sort, values=shadow)
+            if state.aggr:              # add totals row if requested as the first row
+                data.insert(0, totals)
             if len(data) > rows - 3:    # truncate data to fit the terminal size if needed
                 data = data[:rows-3]
-            print(simple_tabulate(data, headers=headers))
+            print(simple_tabulate(data, headers=state.headers))
 
         # exit here if we are not in continuous mode or if quitting
-        if not continuous or QUITTING:
+        if not state.continuous or state.quitting:
             break
 
         # keep history
@@ -865,11 +898,11 @@ def main():
         # Sleep for the specified interval in continuous mode,
         # but also be responsive to user quit requests.
         slept = 0.0
-        delay = min(0.2, INTERVAL)
-        while slept < INTERVAL and not QUITTING:
+        delay = min(0.2, state.inter)
+        while slept < state.inter and not state.quitting:
             time.sleep(delay)
             slept += delay
-            if QUITTING:
+            if state.quitting:
                 break
 
 
