@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.8-1_20250727"
+__version__   = "0.2.8-2_20250727"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -416,9 +416,9 @@ def MAG(_s: str):
     """Make a string bold magenta."""
     return f'{_CC(35, 1)}{_s}{_CC(0)}'
 
-def BOLD(_s: str):
-    """Make a string bold."""
-    return f'{_CC(1)}{_s}{_CC(0)}'
+def INV(_s: str):
+    """Make a string inverse."""
+    return f'{_CC(7)}{_s}{_CC(0)}'
 
 def FAINT(_s: str):
     """Make a string faint (dimmed)."""
@@ -604,32 +604,7 @@ def build_mapping(patt: Optional[Pattern]):
 
 
 def read_stats(mapping: Dict[str, RadosBD], skipped: Set[str]):
-    """
-    Read I/O statistics from `/proc/diskstats` for RBD devices.
-
-    ord | Field
-    --- | -----
-    0   | major number
-    1   | minor number
-    2   | device name (e.g., rbd0)
-    3   | reads completed successfully
-    4   | reads merged
-    5   | read sectors
-    6   | time spent reading (ms)
-    7   | writes completed
-    8   | writes merged
-    9   | written sectors
-    10  | time spent writing (ms)
-    11  | I/Os currently in progress
-    12  | time spent doing I/Os (ms)
-    13  | weighted time spent doing I/Os (ms)
-    14  | discard requests completed (if available)
-    15  | discard requests merged (if available)
-    16  | iscarded sectors (if available)
-    17  | time spent discarding (if available)
-    18  | flush requests completed (if available)
-    19  | time spent flushing (if available)
-    """
+    """Read I/O statistics from `/proc/diskstats` for RBD devices."""
     stats: Dict[str, DiskStatRow] = {}
     max_cols = len(DiskStatField)
     with open(DISKSTATS, encoding='utf-8') as f:
@@ -807,6 +782,25 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
     return data, shadow, totals
 
 
+def update_headers(args, h: List[str]):
+    """Highlight the column we are sorting by in the header line."""
+    # clean up old ANSI codes from the headers
+    h[:] = [ANSI_RX.sub('', col) for col in h]
+
+    # highlight (invert) the column we are sorting by
+    match args.sort:
+        case None | OutputField.RBD:
+            h[OutputField.RBD.value.pos] = INV(h[OutputField.RBD.value.pos])
+        case OutputField.SUM_IO:
+            h[OutputField.R_IOPS.value.pos] = INV(h[OutputField.R_IOPS.value.pos])
+            h[OutputField.W_IOPS.value.pos] = INV(h[OutputField.W_IOPS.value.pos])
+        case OutputField.SUM_MB:
+            h[OutputField.R_MBPS.value.pos] = INV(h[OutputField.R_MBPS.value.pos])
+            h[OutputField.W_MBPS.value.pos] = INV(h[OutputField.W_MBPS.value.pos])
+        case _:
+            h[args.sort.value.pos] = INV(h[args.sort.value.pos])
+
+
 def main():
     args       = parse_cmdline_args()
     continuous = args.inter > 0
@@ -821,14 +815,17 @@ def main():
         listener_t = threading.Thread(target=key_event_handler, daemon=True)
         listener_t.start()
 
-    history: deque[Dict[str, DiskStatRow]] = deque(maxlen=args.hist)
+    # build the headers for the output table
+    headers = [f.value.header for f in OutputField if not (f.value.xtra or f.value.virt)]
     if args.xtra:
-        headers = [f.value.header for f in OutputField if not f.value.virt]
-    else:
-        headers = [f.value.header for f in OutputField if not (f.value.xtra or f.value.virt)]
+        headers.extend([f.value.header for f in OutputField if f.value.xtra])
 
+    # set up header highlighting, history and terminal size
+    update_headers(args, h=headers)
+    history: deque[Dict[str, DiskStatRow]] = deque(maxlen=args.hist)
     termsize = os.get_terminal_size(sys.stdout.fileno())
-    cols, rows = termsize.columns, termsize.lines
+    _, rows = termsize.columns, termsize.lines
+
     while True:
         stats = read_stats(rbd_map, skipped=skip)
 
@@ -849,7 +846,7 @@ def main():
             data, shadow, aggr = parse_data(rbd_map, prev=prev_stats, now=stats,
                                             xtra=args.xtra, aggr=args.aggr, key=args.sort)
             if continuous:
-                cols, rows = clear_terminal()
+                _, rows = clear_terminal()
 
             sort_stats(data, key=args.sort, values=shadow)
             if args.aggr:               # add totals row if requested as the first row
