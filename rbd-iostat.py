@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.2.6-1_20250725"
+__version__   = "0.2.7-1_20250727"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -21,6 +21,7 @@ import time
 import tty
 from argparse import ArgumentParser
 from collections import deque
+from enum import Enum, IntEnum
 from re import compile as re_compile, error as re_error, Pattern
 from typing import Dict, Iterable, List, Optional, Set
 
@@ -31,44 +32,100 @@ TERM_ATTR = termios.tcgetattr(sys.stdin.fileno())
 INTERVAL  = 0.0
 ANSI_RX   = re_compile(r'\x1b\[[0-9;]*m')   # matches standard ANSI color escape sequences
 DISKSTATS = '/proc/diskstats'
-MAX_COLS  = 20  # maximum number of columns to expect in /proc/diskstats
 RBD_GLOB  = '/dev/rbd/*/*'
-FIELDS    = {
-    # Field definitions for the output table
-    # 'ord' is the order of the field in the output (-1 means not displayed),
-    # 'x' is the multiplier (scale) for the field value for colorization,
-    # 'rev' means if field should be reverse sorted (descending),
-    # 'xtra' indicates if the field is an extra (discard/flush) statistic
-    'pool':    {'dsc': 'Pool',      'ord': 0,  'x': 1,   'rev': False, 'xtra': False},
-    'rbd':     {'dsc': 'RBD image', 'ord': 1,  'x': 1,   'rev': False, 'xtra': False},
-    'dev':     {'dsc': 'Device',    'ord': 2,  'x': 1,   'rev': False, 'xtra': False},
-    'size':    {'dsc': 'Size',      'ord': 3,  'x': 1,   'rev': True,  'xtra': False},
-    'r_io':    {'dsc': 'r_iops',    'ord': 4,  'x': 10,  'rev': True,  'xtra': False},
-    'w_io':    {'dsc': 'w_iops',    'ord': 5,  'x': 10,  'rev': True,  'xtra': False},
-    'r_mb':    {'dsc': 'rd MB/s',   'ord': 6,  'x': 1,   'rev': True,  'xtra': False},
-    'w_mb':    {'dsc': 'wr MB/s',   'ord': 7,  'x': 1,   'rev': True,  'xtra': False},
-    'r_rqm':   {'dsc': 'r_rqm/s',   'ord': 8,  'x': 10,  'rev': True,  'xtra': False},
-    'r_rqm_p': {'dsc': '%r_rqm',    'ord': 9,  'x': 1,   'rev': True,  'xtra': False},
-    'w_rqm':   {'dsc': 'w_rqm/s',   'ord': 10, 'x': 10,  'rev': True,  'xtra': False},
-    'w_rqm_p': {'dsc': '%w_rqm',    'ord': 11, 'x': 1,   'rev': True,  'xtra': False},
-    'r_wait':  {'dsc': 'r_await',   'ord': 12, 'x': 1,   'rev': True,  'xtra': False},
-    'w_wait':  {'dsc': 'w_await',   'ord': 13, 'x': 1,   'rev': True,  'xtra': False},
-    'r_sz':    {'dsc': 'rareq-sz',  'ord': 14, 'x': 1,   'rev': True,  'xtra': False},
-    'w_sz':    {'dsc': 'wareq-sz',  'ord': 15, 'x': 1,   'rev': True,  'xtra': False},
-    'queue':   {'dsc': 'aqu-sz',    'ord': 16, 'x': 1,   'rev': True,  'xtra': False},
-    'util':    {'dsc': '%util',     'ord': 17, 'x': 1,   'rev': True,  'xtra': False},
-    'd_io':    {'dsc': 'd_iops',    'ord': 18, 'x': 10,  'rev': True,  'xtra': True},
-    'd_mb':    {'dsc': 'ds MB/s',   'ord': 19, 'x': 1,   'rev': True,  'xtra': True},
-    'd_rqm':   {'dsc': 'd_rqm/s',   'ord': 20, 'x': 10,  'rev': True,  'xtra': True},
-    'd_rqm_p': {'dsc': '%d_rqm',    'ord': 21, 'x': 1,   'rev': True,  'xtra': True},
-    'd_wait':  {'dsc': 'd_await',   'ord': 22, 'x': 1,   'rev': True,  'xtra': True},
-    'd_sz':    {'dsc': 'dareq-sz',  'ord': 23, 'x': 1,   'rev': True,  'xtra': True},
-    'f_io':    {'dsc': 'f_iops',    'ord': 24, 'x': 10,  'rev': True,  'xtra': True},
-    'f_wait':  {'dsc': 'f_await',   'ord': 25, 'x': 1,   'rev': True,  'xtra': True},
-    # virtual sort fields
-    'total_io': {'dsc': 'sum_IOs',  'ord': -1, 'x': 10,  'rev': True,  'xtra': False},
-    'total_mb': {'dsc': 'sum_MB/s', 'ord': -1, 'x': 1,   'rev': True,  'xtra': False},
-    }
+
+class FieldAttrs:
+    __slots__ = ('header', 'pos', 'x', 'rev', 'xtra', 'virt')
+
+    def __init__(self, header: str, pos: int, x = 1, rev = True, xtra = False, virt = False):
+        self.header = header
+        """Column header (description) for display purposes"""
+        self.pos = pos
+        """Column position in the output table"""
+        self.x = x
+        """The multiplier (scale) of the field value for colorization"""
+        self.rev = rev
+        """Whether the field should be reverse sorted (descending)"""
+        self.xtra = xtra
+        """Indicates if the field is an extra (discard/flush) statistic"""
+        self.virt = virt
+        """Indicates if the field is a virtual (aggregate) sort field (not displayed)"""
+
+
+class OutputField(Enum):
+    """Output fields and their order in the table."""
+    POOL    = FieldAttrs('Pool',      pos=0,    rev=False)
+    RBD     = FieldAttrs('RBD image', pos=1,    rev=False)
+    DEV     = FieldAttrs('Device',    pos=2,    rev=False)
+    SIZE    = FieldAttrs('Size',      pos=3)
+    R_IOPS  = FieldAttrs('r_iops',    pos=4,    x=10)
+    W_IOPS  = FieldAttrs('w_iops',    pos=5,    x=10)
+    R_MBPS  = FieldAttrs('rd MB/s',   pos=6)
+    W_MBPS  = FieldAttrs('wr MB/s',   pos=7)
+    R_RQM   = FieldAttrs('r_rqm/s',   pos=8,    x=10)
+    R_RQM_P = FieldAttrs('%r_rqm',    pos=9)
+    W_RQM   = FieldAttrs('w_rqm/s',   pos=10)
+    W_RQM_P = FieldAttrs('%w_rqm',    pos=11)
+    R_WAIT  = FieldAttrs('r_await',   pos=12)
+    W_WAIT  = FieldAttrs('w_await',   pos=13)
+    R_SIZE  = FieldAttrs('rareq-sz',  pos=14,   x=20)
+    W_SIZE  = FieldAttrs('wareq-sz',  pos=15,   x=20)
+    QUEUE   = FieldAttrs('aqu-sz',    pos=16)
+    UTIL    = FieldAttrs('%util',     pos=17)
+    D_IOPS  = FieldAttrs('d_iops',    pos=18,   x=10, xtra=True)
+    D_MBPS  = FieldAttrs('ds MB/s',   pos=19,         xtra=True)
+    D_RQM   = FieldAttrs('d_rqm/s',   pos=20,   x=10, xtra=True)
+    D_RQM_P = FieldAttrs('%d_rqm',    pos=21,         xtra=True)
+    D_WAIT  = FieldAttrs('d_await',   pos=22,         xtra=True)
+    D_SIZE  = FieldAttrs('dareq-sz',  pos=23,         xtra=True)
+    F_IOPS  = FieldAttrs('f_iops',    pos=24,   x=10, xtra=True)
+    F_WAIT  = FieldAttrs('f_await',   pos=25,         xtra=True)
+    SUM_IO  = FieldAttrs('sum_IOs',   pos=-1,   x=10, virt=True)
+    """Total IOPS (read + write + discard + flush)"""
+    SUM_MB  = FieldAttrs('sum_MB/s',  pos=-1,         virt=True)
+    """Total I/O in MB/s (read + write + discard)"""
+
+
+class DiskStatField(IntEnum):
+    """Fields in /proc/diskstats."""
+    MAJOR      = 0
+    MINOR      = 1
+    DEV        = 2
+    """Device name (e.g., rbd0)."""
+    R_IO_OPS   = 3
+    """Read I/O operations completed successfully."""
+    R_MERGES   = 4
+    """Read I/O operations merged."""
+    R_SECTORS  = 5
+    """Read sectors (device-sized blocks)."""
+    R_TIME_MS  = 6
+    """Time spent reading in milliseconds."""
+    W_IO_OPS   = 7
+    """Write I/O operations completed successfully."""
+    W_MERGES   = 8
+    """Write I/O operations merged."""
+    W_SECTORS  = 9
+    """Written sectors (device-sized blocks)."""
+    W_TIME_MS  = 10
+    """Time spent writing in milliseconds."""
+    IO_ACTIVE  = 11
+    """I/Os currently in progress."""
+    IO_TIME_MS = 12
+    """Time spent doing I/Os in milliseconds."""
+    IO_TM_W_MS = 13
+    """Weighted time spent doing IO in ms (time is proportional to amount of IOs inflight)."""
+    D_IO_OPS   = 14
+    """Discard requests completed."""
+    D_MERGES   = 15
+    """Discard requests merged."""
+    D_SECTORS  = 16
+    """Discarded sectors (device-sized blocks)."""
+    D_TIME_MS  = 17
+    """Time spent discarding in milliseconds."""
+    F_IO_OPS   = 18
+    """Flush requests completed."""
+    F_TIME_MS  = 19
+    """Time spent flushing in milliseconds."""
 
 
 class RadosBD:
@@ -142,39 +199,22 @@ class DiskStatRow:
     when: float
     """When the data was sampled (timestamp)."""
     r_io: int
-    """Read I/O operations completed successfully."""
     r_merge: int
-    """Read I/O operations merged."""
     r_sect: int
-    """Read sectors (device-sized blocks)."""
     r_time_ms: int
-    """Time spent reading in milliseconds."""
     w_io: int
-    """Write I/O operations completed successfully."""
     w_merge: int
-    """Write I/O operations merged."""
     w_sect: int
-    """Written sectors (device-sized blocks)."""
     w_time_ms: int
-    """Time spent writing in milliseconds."""
     io_active: int
-    """I/Os currently in progress."""
     io_t_ms: int
-    """Time spent doing I/Os in milliseconds."""
     io_t_w_ms: int
-    """Weighted time spent doing IO in ms (time is proportional to amount of IOs inflight)."""
     d_io: int = 0
-    """Discard requests completed."""
     d_merge: int = 0
-    """Discard requests merged."""
     d_sect: int = 0
-    """Discarded sectors (device-sized blocks)."""
     d_time_ms: int = 0
-    """Time spent discarding in milliseconds."""
     f_io: int = 0
-    """Flush requests completed."""
     f_time_ms: int = 0
-    """Time spent flushing in milliseconds."""
 
     def __init__(self, dev: RadosBD, fields: List[str], ts: float):
         """
@@ -185,33 +225,35 @@ class DiskStatRow:
             fields: A row from `/proc/diskstats`.
             ts: Timestamp when the data was sampled.
         """
-        if not dev.dev == fields[2]:
-            raise ValueError(f'Device mismatch: {dev.dev} != {fields[2]}')
+        if not dev.dev == fields[DiskStatField.DEV]:
+            raise ValueError(f'Device mismatch: {dev.dev} != {fields[DiskStatField.DEV]}')
         self.when = ts
         self.dev = dev
-        self.r_io      = int(fields[3])
-        self.r_merge   = int(fields[4])
-        self.r_sect    = int(fields[5])
-        self.r_time_ms = int(fields[6])
-        self.w_io      = int(fields[7])
-        self.w_merge   = int(fields[8])
-        self.w_sect    = int(fields[9])
-        self.w_time_ms = int(fields[10])
-        self.io_active = int(fields[11])
-        self.io_t_ms   = int(fields[12])
-        self.io_t_w_ms = int(fields[13])
+        # convert numeric fields to integers
+        fields[DiskStatField.R_IO_OPS:] = map(int, fields[DiskStatField.R_IO_OPS:])
+        self.r_io      = fields[DiskStatField.R_IO_OPS]
+        self.r_merge   = fields[DiskStatField.R_MERGES]
+        self.r_sect    = fields[DiskStatField.R_SECTORS]
+        self.r_time_ms = fields[DiskStatField.R_TIME_MS]
+        self.w_io      = fields[DiskStatField.W_IO_OPS]
+        self.w_merge   = fields[DiskStatField.W_MERGES]
+        self.w_sect    = fields[DiskStatField.W_SECTORS]
+        self.w_time_ms = fields[DiskStatField.W_TIME_MS]
+        self.io_active = fields[DiskStatField.IO_ACTIVE]
+        self.io_t_ms   = fields[DiskStatField.IO_TIME_MS]
+        self.io_t_w_ms = fields[DiskStatField.IO_TM_W_MS]
 
         # discard fields (if available)
         if len(fields) >= 15:
-            self.d_io      = int(fields[14])
-            self.d_merge   = int(fields[15])
-            self.d_sect    = int(fields[16])
-            self.d_time_ms = int(fields[17])
+            self.d_io      = fields[DiskStatField.D_IO_OPS]
+            self.d_merge   = fields[DiskStatField.D_MERGES]
+            self.d_sect    = fields[DiskStatField.D_SECTORS]
+            self.d_time_ms = fields[DiskStatField.D_TIME_MS]
 
         # flush fields (if available)
         if len(fields) >= 19:
-            self.f_io      = int(fields[18])
-            self.f_time_ms = int(fields[19])
+            self.f_io      = fields[DiskStatField.F_IO_OPS]
+            self.f_time_ms = fields[DiskStatField.F_TIME_MS]
 
 
 class DiskStatDelta:
@@ -235,69 +277,72 @@ class DiskStatDelta:
         self.io_t     = now.io_t_ms   - prev.io_t_ms
         self.io_t_w   = now.io_t_w_ms - prev.io_t_w_ms
 
-    def __getitem__(self, item: str) -> float:
+    def __getitem__(self, item: OutputField) -> float:
+        if not isinstance(item, OutputField):
+            raise TypeError(f'Expected OutputField, got {type(item)}')
+
         ret = 0.0
         if self.delta_t <= 0:
             return ret  # avoid division by zero
 
         match item:
-            case 'r_io':
+            case OutputField.R_IOPS:
                 ret = self.rd_c / self.delta_t
-            case 'w_io':
+            case OutputField.W_IOPS:
                 ret = self.wr_c / self.delta_t
-            case 'r_mb':
+            case OutputField.R_MBPS:
                 ret = (self.rd_sect / 2048) / self.delta_t
-            case 'w_mb':
+            case OutputField.W_MBPS:
                 ret = (self.wr_sect / 2048) / self.delta_t
-            case 'r_rqm':
+            case OutputField.R_RQM:
                 ret = self.rd_m / self.delta_t
-            case 'w_rqm':
+            case OutputField.W_RQM:
                 ret = self.wr_m / self.delta_t
-            case 'r_rqm_p':
+            case OutputField.R_RQM_P:
                 if self.rd_m + self.rd_c > 0:
                     ret = 100 * self.rd_m / (self.rd_m + self.rd_c)
-            case 'w_rqm_p':
+            case OutputField.W_RQM_P:
                 if self.wr_m + self.wr_c > 0:
                     ret = 100 * self.wr_m / (self.wr_m + self.wr_c)
-            case 'r_wait':
+            case OutputField.R_WAIT:
                 if self.rd_c > 0:
                     ret = self.r_time / self.rd_c
-            case 'w_wait':
+            case OutputField.W_WAIT:
                 if self.wr_c > 0:
                     ret = self.w_time / self.wr_c
-            case 'r_sz':
+            case OutputField.R_SIZE:
                 if self.rd_c > 0:
                     ret = self.rd_sect / self.rd_c
-            case 'w_sz':
+            case OutputField.W_SIZE:
                 if self.wr_c > 0:
                     ret = self.wr_sect / self.wr_c
-            case 'queue':
+            case OutputField.QUEUE:
                 ret = self.io_t_w / (self.delta_t * 1e3)
-            case 'util':
+            case OutputField.UTIL:
                 ret = 100 * self.io_t / (self.delta_t * 1e3)
-            case 'd_io':
+            case OutputField.D_IOPS:
                 ret = self.disc_c / self.delta_t
-            case 'd_mb':
+            case OutputField.D_MBPS:
                 ret = (self.dsc_sect / 2048) / self.delta_t
-            case 'd_rqm':
+            case OutputField.D_RQM:
                 ret = self.dsc_m / self.delta_t
-            case 'd_rqm_p':
+            case OutputField.D_RQM_P:
                 if self.dsc_m + self.disc_c > 0:
                     ret = 100 * self.dsc_m / (self.dsc_m + self.disc_c)
-            case 'd_wait':
+            case OutputField.D_WAIT:
                 if self.disc_c > 0:
                     ret = self.d_time / self.disc_c
-            case 'd_sz':
+            case OutputField.D_SIZE:
                 if self.disc_c > 0:
                     ret = self.dsc_sect / self.disc_c
-            case 'f_io':
+            case OutputField.F_IOPS:
                 ret = self.flush_c / self.delta_t
-            case 'f_wait':
+            case OutputField.F_WAIT:
                 if self.flush_c > 0:
                     ret = self.f_time / self.flush_c
-            case 'total_io':    # total IOPS (read + write + discard + flush)
+            case OutputField.SUM_IO:
                 ret = (self.rd_c + self.wr_c + self.disc_c + self.flush_c) / self.delta_t
-            case 'total_mb':    # total I/O in MB/s (read + write + discard)
+            case OutputField.SUM_MB:
                 ret = ((self.rd_sect + self.wr_sect + self.dsc_sect) / 2048) / self.delta_t
             case _:
                 raise KeyError(f'Unknown field: {item}')
@@ -314,7 +359,7 @@ def parse_cmdline_args():
     args.add_argument('--name', '-N', help='Which RBDs to monitor [regex] (default: all)')
     args.add_argument('--hist', '-H', type=int, default=1,
                       help='Statistics history entries to keep (default: 1, min: 1)')
-    args.add_argument('--sort', choices=tuple(f[0] for f in FIELDS.items() if not f[1]['xtra']),
+    args.add_argument('--sort', choices=[f.name.lower() for f in OutputField if not f.value.xtra],
                       help='Which column to sort by (default: RBD name / pool name)')
     args.add_argument('--extra', '-x', action='store_true', dest='xtra',
                       help='Include extended (discard/flush) statistics in the output')
@@ -326,6 +371,7 @@ def parse_cmdline_args():
     # validate/adjust arguments
     p.inter = max(0.0, p.inter) # ensure interval is non-negative
     p.hist = max(1, p.hist)     # ensure history is at least 1 entry
+    p.sort = OutputField[p.sort.upper()] if p.sort else None
 
     # RBD pool and name filtering
     if p.pool:
@@ -574,24 +620,25 @@ def read_stats(mapping: Dict[str, RadosBD], skipped: Set[str]):
     19  | time spent flushing (if available)
     """
     stats: Dict[str, DiskStatRow] = {}
+    max_cols = len(DiskStatField)
     with open(DISKSTATS, encoding='utf-8') as f:
         timestamp = time.time()
         for line in f:
             parts = line.split()
             num_fields = len(parts)
-            dev = parts[2]
+            dev = parts[DiskStatField.DEV]
 
             if dev in skipped or not dev.startswith('rbd') or dev not in mapping:
                 continue
 
-            if num_fields > MAX_COLS or num_fields < MAX_COLS - 6:
+            if num_fields > max_cols or num_fields < max_cols - 6:
                 eprint(f'WARN: unsupported number of fields in {DISKSTATS} for {dev}:',
-                       f'expected {MAX_COLS-6} to {MAX_COLS}, got {num_fields}')
+                       f'expected {max_cols-6} to {max_cols}, got {num_fields}')
                 continue
 
             # pad with zeroes for missing fields to avoid IndexError later
-            if num_fields < 20:
-                parts.extend(['0'] * (MAX_COLS - num_fields))
+            if num_fields < max_cols:
+                parts.extend(['0'] * (max_cols - num_fields))
 
             # construct DiskStatRow object and associate it with the RadosBD
             mapping[dev].last_stats = timestamp
@@ -599,20 +646,21 @@ def read_stats(mapping: Dict[str, RadosBD], skipped: Set[str]):
     return stats
 
 
-def sort_stats(stats: List[List[str]], key: str | None, values: List[float]):
+def sort_stats(stats: List[List[str]], key: Optional[OutputField], values: List[float]):
     """Sort the statistics data in-place based on the specified column."""
     match key:
-        case None | 'rbd':
-            stats.sort(key=lambda x: (x[1], x[0]))
-        case 'pool':
-            stats.sort(key=lambda x: (x[0], x[1]))
-        case 'dev':
-            stats.sort(key=lambda x: x[2])
+        case None | OutputField.RBD:
+            stats.sort(key=lambda x: (x[OutputField.RBD.value.pos], x[OutputField.POOL.value.pos]))
+        case OutputField.POOL:
+            stats.sort(key=lambda x: (x[OutputField.POOL.value.pos], x[OutputField.RBD.value.pos]))
+        case OutputField.DEV:
+            stats.sort(key=lambda x: x[OutputField.DEV.value.pos])
         case _:
             # sort based on values[i] as primary, indexed[i][1] as secondary (rbd image name)
             # this extra indexing step is needed for matching each row with its sort value
             indexed = list(enumerate(stats))
-            indexed.sort(key=lambda x: (values[x[0]], x[1][1]), reverse=FIELDS[key]['rev'])
+            indexed.sort(key=lambda x: (values[x[0]], x[1][OutputField.RBD.value.pos]),
+                         reverse=key.value.rev)
 
             # unpack the sorted 'stats' back in-place
             for i, (_, row) in enumerate(indexed):
@@ -622,11 +670,11 @@ def sort_stats(stats: List[List[str]], key: str | None, values: List[float]):
 def colorize(text: str, val: float | int, scale = 1.0):
     """Colorize the text based on the value."""
     if val == 0:
+        return '-'
+    if val < 1.5 * scale:
         return FAINT(text)
-    if val < 0.5 * scale:
-        return text
     if val < 25 * scale:
-        return BOLD(text)
+        return text
     if val < 50 * scale:
         return BLU(text)
     if val < 70 * scale:
@@ -637,16 +685,16 @@ def colorize(text: str, val: float | int, scale = 1.0):
 
 
 def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
-               now: Dict[str, DiskStatRow], xtra: bool, aggr: bool, sort_key: Optional[str]):
+               now: Dict[str, DiskStatRow], xtra: bool, aggr: bool, key: Optional[OutputField]):
     """
     Parse the current statistics data to compute I/O rates. Also returns a list of
     raw values for selected sorting column, if required. Aggregates certain fields
     into totals if requested as well.
     """
-    def colorize_row(field: str, precision: int) -> str:
-        """Helper for colorizing a row based on the field and its value."""
+    def fmt_cell(field: OutputField, precision: int) -> str:
+        """Helper for colorizing a cell based on the field and its value."""
         val = delta[field]
-        return colorize(f'{val:.{precision}f}', val=val, scale=FIELDS[field]['x'])
+        return colorize(f'{val:.{precision}f}', val, scale=field.value.x)
 
     data: List[str] = []
     shadow: List[float] = []
@@ -667,71 +715,66 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
             GRN(mapping[dev].image),    # RBD name
             mapping[dev].dev,           # /dev/rbdX
             mapping[dev].size_str,      # human-readable size
-            colorize_row('r_io', 0),
-            colorize_row('w_io', 0),
-            colorize_row('r_mb', 1),
-            colorize_row('w_mb', 1),
-            colorize_row('r_rqm', 0),
-            f"{delta['r_rqm_p']:.2f}",
-            colorize_row('w_rqm', 0),
-            f"{delta['w_rqm_p']:.2f}",
-            colorize_row('r_wait', 1),
-            colorize_row('w_wait', 1),
-            f"{delta['r_sz']:.1f}",
-            f"{delta['w_sz']:.1f}",
-            colorize_row('queue', 1),
-            colorize_row('util', 2),
+            fmt_cell(OutputField.R_IOPS, 0), fmt_cell(OutputField.W_IOPS, 0),
+            fmt_cell(OutputField.R_MBPS, 1), fmt_cell(OutputField.W_MBPS, 1),
+            fmt_cell(OutputField.R_RQM, 0),  fmt_cell(OutputField.R_RQM_P, 2),
+            fmt_cell(OutputField.W_RQM, 0),  fmt_cell(OutputField.W_RQM_P, 2),
+            fmt_cell(OutputField.R_WAIT, 1), fmt_cell(OutputField.W_WAIT, 1),
+            fmt_cell(OutputField.R_SIZE, 1), fmt_cell(OutputField.W_SIZE, 1),
+            fmt_cell(OutputField.QUEUE, 1),  fmt_cell(OutputField.UTIL, 2),
             ]
 
         if aggr:  # add current RBD to the aggregate totals
             tmp['size']  += mapping[dev].size
-            tmp['r_io']  += delta['r_io']
-            tmp['w_io']  += delta['w_io']
-            tmp['r_mb']  += delta['r_mb']
-            tmp['w_mb']  += delta['w_mb']
-            tmp['r_rqm'] += delta['r_rqm']
-            tmp['w_rqm'] += delta['w_rqm']
+            tmp['r_io']  += delta[OutputField.R_IOPS]
+            tmp['w_io']  += delta[OutputField.W_IOPS]
+            tmp['r_mb']  += delta[OutputField.R_MBPS]
+            tmp['w_mb']  += delta[OutputField.W_MBPS]
+            tmp['r_rqm'] += delta[OutputField.R_RQM]
+            tmp['w_rqm'] += delta[OutputField.W_RQM]
             # weighted average aqu-sz and %util
-            if delta['queue'] > 0:
+            if delta[OutputField.QUEUE] > 0:
                 tmp['n_queue'] += 1
-                tmp['queue'] += delta['queue']
-            if delta['util'] > 0:
+                tmp['queue'] += delta[OutputField.QUEUE]
+            if delta[OutputField.UTIL] > 0:
                 tmp['n_util'] += 1
-                tmp['util']  += delta['util']
+                tmp['util']  += delta[OutputField.UTIL]
 
         if xtra:    # add discard+flush statistics if requested
             row.extend([
-                f"{delta['d_io']:.0f}",
-                f"{delta['d_mb']:.1f}",
-                f"{delta['d_rqm']:.1f}",
-                f"{delta['d_rqm_p']:.2f}",
-                f"{delta['d_wait']:.1f}",
-                f"{delta['d_sz']:.1f}",
-                f"{delta['f_io']:.0f}",
-                f"{delta['f_wait']:.2f}",
+                f"{delta[OutputField.D_IOPS]:.0f}",
+                f"{delta[OutputField.D_MBPS]:.1f}",
+                f"{delta[OutputField.D_RQM]:.1f}",
+                f"{delta[OutputField.D_RQM_P]:.2f}",
+                f"{delta[OutputField.D_WAIT]:.1f}",
+                f"{delta[OutputField.D_SIZE]:.1f}",
+                f"{delta[OutputField.F_IOPS]:.0f}",
+                f"{delta[OutputField.F_WAIT]:.2f}",
                 ])
 
             if aggr:
-                tmp['d_io']  += delta['d_io']
-                tmp['d_mb']  += delta['d_mb']
-                tmp['d_rqm'] += delta['d_rqm']
-                tmp['f_io']  += delta['f_io']
+                tmp['d_io']  += delta[OutputField.D_IOPS]
+                tmp['d_mb']  += delta[OutputField.D_MBPS]
+                tmp['d_rqm'] += delta[OutputField.D_RQM]
+                tmp['f_io']  += delta[OutputField.F_IOPS]
 
         data.append(row)
-        if sort_key:
+        if key:
             # if sorting is requested, we want to keep the actual values of that column around
             # virtual sort keys also need special handling, as they have no column in the output
-            match sort_key:
-                case 'rbd' | 'pool' | 'dev':    # strings require no shadowing
-                    pass
-                case 'size':
+            match key:
+                case OutputField.RBD | OutputField.POOL | OutputField.DEV:
+                    pass    # strings require no shadowing
+                case OutputField.SIZE:
                     shadow.append(mapping[dev].size)
-                case 'total_io':
-                    shadow.append(delta['r_io'] + delta['w_io'] + delta['d_io'] + delta['f_io'])
-                case 'total_mb':
-                    shadow.append(delta['r_mb'] + delta['w_mb'] + delta['d_mb'])
+                case OutputField.SUM_IO:
+                    shadow.append(delta[OutputField.R_IOPS] + delta[OutputField.W_IOPS] +
+                                  delta[OutputField.D_IOPS] + delta[OutputField.F_IOPS])
+                case OutputField.SUM_MB:
+                    shadow.append(delta[OutputField.R_MBPS] + delta[OutputField.W_MBPS] +
+                                  delta[OutputField.D_MBPS])
                 case _:
-                    shadow.append(delta[sort_key])
+                    shadow.append(delta[key])
 
         if aggr:
             # avoid division by zero with aqu-sz and %util
@@ -766,9 +809,9 @@ def main():
 
     history: deque[Dict[str, DiskStatRow]] = deque(maxlen=args.hist)
     if args.xtra:
-        headers = tuple(f['dsc'] for f in FIELDS.values() if f['ord'] >= 0)
+        headers = [f.value.header for f in OutputField if not f.value.virt]
     else:
-        headers = tuple(f['dsc'] for f in FIELDS.values() if f['ord'] >= 0 and not f['xtra'])
+        headers = [f.value.header for f in OutputField if not (f.value.xtra or f.value.virt)]
 
     while True:
         stats = read_stats(rbd_map, skipped=skip)
@@ -777,7 +820,7 @@ def main():
             # assume first read is at system boot
             prev_time  = time.time() - float(read_oneline_file('/proc/uptime').split()[0])
             prev_stats = {dev: DiskStatRow(dev=rbd_map[dev],
-                                           fields=['0', '0', dev] + ['0'] * MAX_COLS,
+                                           fields=['0', '0', dev] + ['0'] * len(DiskStatField),
                                            ts=prev_time)
                           for dev in stats}
             if continuous:
@@ -788,7 +831,7 @@ def main():
         # parse & display the data
         if not PAUSED:
             data, shadow, aggr = parse_data(rbd_map, prev=prev_stats, now=stats,
-                                            xtra=args.xtra, aggr=args.aggr, sort_key=args.sort)
+                                            xtra=args.xtra, aggr=args.aggr, key=args.sort)
             if continuous:
                 clear_terminal()
 
@@ -796,7 +839,7 @@ def main():
             # add totals row if requested as the first row after sorting
             if args.aggr:
                 data.insert(0, aggr)
-            print(simple_tabulate(data, headers=tuple(BOLD(h) for h in headers)))
+            print(simple_tabulate(data, headers=headers))
 
         # exit here if we are not in continuous mode or if quitting
         if not continuous or QUITTING:
