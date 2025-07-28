@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.0-1_20250727"
+__version__   = "0.3.0-2_20250728"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -191,6 +191,10 @@ class RadosBD:
 
 class DiskStatRow:
     """Represents a single row from `/proc/diskstats`."""
+    __slots__ = ('dev', 'when', 'r_io', 'r_merge', 'r_sect', 'r_time_ms', 'w_io', 'w_merge',
+                 'w_sect', 'w_time_ms', 'io_active', 'io_t_ms', 'io_t_w_ms', 'd_io', 'd_merge',
+                 'd_sect', 'd_time_ms', 'f_io', 'f_time_ms')
+
     dev: RadosBD
     """Which device this data belongs to."""
     when: float
@@ -206,12 +210,12 @@ class DiskStatRow:
     io_active: int
     io_t_ms: int
     io_t_w_ms: int
-    d_io: int = 0
-    d_merge: int = 0
-    d_sect: int = 0
-    d_time_ms: int = 0
-    f_io: int = 0
-    f_time_ms: int = 0
+    d_io: int
+    d_merge: int
+    d_sect: int
+    d_time_ms: int
+    f_io: int
+    f_time_ms: int
 
     def __init__(self, dev: RadosBD, fields: List[str], ts: float):
         """
@@ -241,6 +245,7 @@ class DiskStatRow:
         self.io_t_w_ms = fields[DiskStatField.IO_TM_W_MS]
 
         # discard fields (if available)
+        self.d_io = self.d_merge = self.d_sect = self.d_time_ms = 0
         if len(fields) >= 15:
             self.d_io      = fields[DiskStatField.D_IO_OPS]
             self.d_merge   = fields[DiskStatField.D_MERGES]
@@ -248,6 +253,7 @@ class DiskStatRow:
             self.d_time_ms = fields[DiskStatField.D_TIME_MS]
 
         # flush fields (if available)
+        self.f_io = self.f_time_ms = 0
         if len(fields) >= 19:
             self.f_io      = fields[DiskStatField.F_IO_OPS]
             self.f_time_ms = fields[DiskStatField.F_TIME_MS]
@@ -255,6 +261,10 @@ class DiskStatRow:
 
 class DiskStatDelta:
     """The delta between two `DiskStatRow`s. Used to compute the I/O rates between samples."""
+    __slots__ = ('delta_t', 'rd_c', 'wr_c', 'disc_c', 'flush_c',
+                 'rd_m', 'wr_m', 'dsc_m', 'rd_sect', 'wr_sect', 'dsc_sect',
+                 'r_time', 'w_time', 'd_time', 'f_time', 'io_t', 'io_t_w')
+
     def __init__(self, prev: DiskStatRow, now: DiskStatRow):
         self.delta_t  = now.when      - prev.when
         self.rd_c     = now.r_io      - prev.r_io
