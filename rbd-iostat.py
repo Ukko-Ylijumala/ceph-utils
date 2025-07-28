@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.0-3_20250728"
+__version__   = "0.3.1-1_20250728"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -21,7 +21,7 @@ import tty
 from argparse import ArgumentParser
 from collections import deque
 from enum import Enum, IntEnum
-from re import compile as re_compile, error as re_error, Pattern
+from re import compile as re_compile, error as re_error, match as re_match, Pattern
 from threading import Lock, Thread
 from typing import Dict, Iterable, List, Optional, Set
 
@@ -434,13 +434,37 @@ class SharedState:
         self._headers = h
 
 
+class SizeFilter:
+    """Class to represent a size filter expression for RBDs."""
+    multi = {'': 1, 'M': 1024 ** 2, 'G': 1024 ** 3, 'T': 1024 ** 4 }
+
+    def __init__(self, expression: str):
+        match = re_match(r'^([<>]?)(\d+)([MGT]?)$', expression)
+        if not match:
+            raise ValueError('parsing error: format is "[operator]num[M/G/T]", '
+                'where operator is "<" or ">", num is an integer and M/G/T are suffixes '
+                'for MiB/GiB/TiB, respectively. Operator and suffix are optional.')
+        op, num_str, suffix = match.groups()
+        self.op = op if op else '='
+        self.num = int(num_str)
+        self.limit = self.num * self.multi.get(suffix, 1)
+
+    def matches(self, value: int):
+        match self.op:
+            case '=':
+                return value == self.limit
+            case '<':
+                return value <= self.limit
+            case '>':
+                return value >= self.limit
+        return False
+
+
 def parse_cmdline_args():
     """Parse command-line arguments."""
     args = ArgumentParser(description='RBD I/O statistics monitor')
     args.add_argument('inter', nargs='?', type=float, default=0.0,
                       help='Continuous statistics interval (default: 0, i.e., one-shot)')
-    args.add_argument('--pool', '-P', help='Which pool to monitor (default: all)')
-    args.add_argument('--name', '-N', help='Which RBDs to monitor [regex] (default: all)')
     args.add_argument('--hist', '-H', type=int, default=1,
                       help='Statistics history entries to keep (default: 1, min: 1)')
     args.add_argument('--sort', choices=[f.name.lower() for f in OutputField if not f.value.xtra],
@@ -449,8 +473,13 @@ def parse_cmdline_args():
                       help='Include extended (discard/flush) statistics in the output')
     args.add_argument('--totals', '-T', action='store_true', dest='aggr',
                       help='Include combined statistics (IOPS, MB/s etc) in the output')
-    args.add_argument('--nozero', '-Z', action='store_true', dest='hide',
+    FLTR = args.add_argument_group(title='RBD filtering options')
+    FLTR.add_argument('--pool', '-P', help='Which pool to monitor (default: all)')
+    FLTR.add_argument('--name', '-N', help='Which RBDs to monitor [regex] (default: all)')
+    FLTR.add_argument('--nozero', '-Z', action='store_true', dest='hide',
                       help='Hide RBDs with no activity in the output')
+    FLTR.add_argument('--size', dest='size',
+                      help='Size filter expression (format: [<|>]num[M/G/T] )')
     args.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     p = args.parse_args()
 
@@ -469,6 +498,12 @@ def parse_cmdline_args():
             p.name = re_compile(p.name)  # validate regex
         except re_error as e:
             args.error(f'Invalid regex for RBD name: {e}')
+
+    if p.size:
+        try:
+            p.size = SizeFilter(p.size)  # parse size filter expression
+        except ValueError as e:
+            args.error(f'Invalid --size: "{p.size}": {e}')
 
     return p
 
@@ -675,7 +710,7 @@ def key_event_handler(s: SharedState):
                 continue
 
 
-def build_mapping(patt: Optional[Pattern]):
+def build_mapping(patt: Optional[Pattern], size: Optional[SizeFilter]):
     """Build mapping from `rbdX` to `pool/rbd_name`"""
     mapping: Dict[str, RadosBD] = {}
     skipped: Set[str] = set()
@@ -696,6 +731,9 @@ def build_mapping(patt: Optional[Pattern]):
                     continue
 
                 blocks = int(read_oneline_file(f'/sys/block/{dev}/size').strip())
+                if size and not size.matches(blocks * 512):
+                    skipped.add(dev)
+                    continue
                 mapping[dev] = RadosBD(pool, image=rbd_name, dev=dev, blocks=blocks)
 
     return mapping, skipped
@@ -882,7 +920,7 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
 
 def main():
     args = parse_cmdline_args()
-    rbd_map, skip = build_mapping(patt=args.name)
+    rbd_map, skip = build_mapping(patt=args.name, size=args.size)
     if not rbd_map:
         print('No mapped Rados Block Devices found.')
         sys.exit(0)
