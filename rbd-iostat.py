@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.1-1_20250728"
+__version__   = "0.3.2-1_20250728"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -23,7 +23,7 @@ from collections import deque
 from enum import Enum, IntEnum
 from re import compile as re_compile, error as re_error, match as re_match, Pattern
 from threading import Lock, Thread
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Deque, Dict, Iterable, List, Optional, Set
 
 MY_NAME   = os.path.basename(__file__)
 TERM_ATTR = termios.tcgetattr(sys.stdin.fileno())
@@ -359,6 +359,8 @@ class DiskStatDelta:
 
 class SharedState:
     """Shared program state for threading."""
+    history: deque[Dict[str, DiskStatRow]]
+
     def __init__(self, args):
         self._lock = Lock()
         self.hide: bool = args.hide
@@ -806,6 +808,48 @@ def colorize(text: str, val: float | int, scale = 1.0):
     return RED(text)
 
 
+def compute_weighted_delta(dev: str, history: Deque[Dict[str, DiskStatRow]], decay = 0.5):
+    """
+    Compute a time-weighted delta for a given device using exponential decay.
+    
+    Args:
+        dev: Device name (e.g., 'rbd0').
+        history: Deque of past DiskStatRow snapshots.
+        decay: Decay factor (`0 < decay < 1`), higher = more weight on recent samples.
+    
+    Returns:
+        A DiskStatDelta representing the weighted average, or None if not enough data.
+    """
+    if len(history) < 2 or any(dev not in snap for snap in history):
+        return None
+
+    weighted = None
+    total_weight = 0.0
+    weight = 1.0
+
+    for i in range(len(history) - 1, 0, -1):
+        prev = history[i - 1][dev]
+        now = history[i][dev]
+        delta = DiskStatDelta(prev, now)
+
+        if weighted is None:
+            weighted = delta
+            for attr in delta.__slots__:    # can't use vars(delta) here, as it requires a dict
+                setattr(weighted, attr, getattr(delta, attr) * weight)
+        else:
+            for attr in delta.__slots__:
+                setattr(weighted, attr, getattr(weighted, attr) + getattr(delta, attr) * weight)
+
+        total_weight += weight
+        weight *= decay  # exponential decay
+
+    # Normalize
+    for attr in weighted.__slots__:
+        setattr(weighted, attr, getattr(weighted, attr) / total_weight)
+
+    return weighted
+
+
 def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
                now: Dict[str, DiskStatRow], state: SharedState,):
     """
@@ -831,7 +875,13 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
         if dev not in now:
             continue
 
-        delta = DiskStatDelta(prev=prev[dev], now=now[dev])
+        if state.history.maxlen > 1 and len(state.history) > 2:
+            delta = compute_weighted_delta(dev, history=state.history, decay=0.75)
+            if delta is None:
+                continue
+        else:
+            delta = DiskStatDelta(prev=prev[dev], now=now[dev])
+
         if state.hide and (delta.rd_c + delta.wr_c + delta.disc_c + delta.flush_c) == 0:
             continue
 
@@ -932,14 +982,14 @@ def main():
         listener_t.start()
 
     # set up history and terminal size
-    history: deque[Dict[str, DiskStatRow]] = deque(maxlen=args.hist)
+    state.history = deque(maxlen=args.hist)
     termsize = os.get_terminal_size(sys.stdout.fileno())
     _, rows = termsize.columns, termsize.lines
 
     while True:
         stats = read_stats(rbd_map, skipped=skip)
 
-        if len(history) == 0:
+        if len(state.history) == 0:
             # assume first read is at system boot
             prev_time  = time.time() - float(read_oneline_file('/proc/uptime').split()[0])
             prev_stats = {dev: DiskStatRow(dev=rbd_map[dev],
@@ -947,9 +997,9 @@ def main():
                                            ts=prev_time)
                           for dev in stats}
             if state.continuous:
-                history.append(prev_stats)
+                state.history.append(prev_stats)
         else:
-            prev_stats = history[-1]
+            prev_stats = state.history[-1]
 
         # parse & display the data
         if not state.paused:
@@ -969,7 +1019,7 @@ def main():
             break
 
         # keep history
-        history.append(stats)
+        state.history.append(stats)
 
         # Sleep for the specified interval in continuous mode,
         # but also be responsive to user quit requests.
