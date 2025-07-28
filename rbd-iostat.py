@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.0-2_20250728"
+__version__   = "0.3.0-3_20250728"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -654,6 +654,9 @@ def key_event_handler(s: SharedState):
                 if s.inter >= 1:   # limit min interval to 1 seconds
                     s.inter -= int_step
                     eprint(f'*** Interval decreased to {s.inter:.1f} seconds')
+            case 'a':
+                s.aggr = not s.aggr
+                eprint('*** Showing aggregate totals' if s.aggr else '*** Hiding aggregates...')
             case 'z':
                 s.hide = not s.hide
                 eprint('*** Hiding RBDs with no activity' if s.hide else '*** Showing all RBDs...')
@@ -661,7 +664,8 @@ def key_event_handler(s: SharedState):
                 s.paused = True
                 eprint(f"\n{MY_NAME} - 'q' to exit, '<space>' to pause/resume,",
                        f"'+'/'-' to incr/decr display interval (0.5s < ±{int_step} < 10s),",
-                       "'z' to show/hide inactive RBDs, \u2190/\u2192 to change sort column")
+                       '\u2190/\u2192 to change sort column,',
+                       "\n'z' to show/hide inactive RBDs, 'a' to toggle aggregate totals")
             case '\x03':    # handle Ctrl+C gracefully, otherwise terminal may be garbled
                 eprint('\nInterrupted (listener thread)...')
                 restore_terminal()
