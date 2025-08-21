@@ -9,7 +9,7 @@ performance of RBD devices.
 
 __author__    = "Mikko Tanner"
 __copyright__ = f"(c) {__author__} 2025"
-__version__   = "0.3.2-1_20250728"
+__version__   = "0.3.2-2_20250821"
 __license__   = "GPL-3.0-or-later"
 
 import glob
@@ -78,9 +78,9 @@ class OutputField(Enum):
     F_IOPS  = FieldAttrs('f_iops',    pos=24,   x=10, xtra=True)
     F_WAIT  = FieldAttrs('f_await',   pos=25,         xtra=True)
     SUM_IO  = FieldAttrs('sum_IOs',   pos=-1,   x=10, virt=True)
-    """Total IOPS (read + write + discard + flush)"""
+    """Total IOPS (read + write + discard + flush). Virtual field, not displayed."""
     SUM_MB  = FieldAttrs('sum_MB/s',  pos=-1,         virt=True)
-    """Total I/O in MB/s (read + write + discard)"""
+    """Total I/O in MB/s (read + write + discard). Virtual field, not displayed."""
 
 
 class DiskStatField(IntEnum):
@@ -191,6 +191,7 @@ class RadosBD:
 
 class DiskStatRow:
     """Represents a single row from `/proc/diskstats`."""
+
     __slots__ = ('dev', 'when', 'r_io', 'r_merge', 'r_sect', 'r_time_ms', 'w_io', 'w_merge',
                  'w_sect', 'w_time_ms', 'io_active', 'io_t_ms', 'io_t_w_ms', 'd_io', 'd_merge',
                  'd_sect', 'd_time_ms', 'f_io', 'f_time_ms')
@@ -245,22 +246,25 @@ class DiskStatRow:
         self.io_t_w_ms = fields[DiskStatField.IO_TM_W_MS]
 
         # discard fields (if available)
-        self.d_io = self.d_merge = self.d_sect = self.d_time_ms = 0
         if len(fields) >= 15:
             self.d_io      = fields[DiskStatField.D_IO_OPS]
             self.d_merge   = fields[DiskStatField.D_MERGES]
             self.d_sect    = fields[DiskStatField.D_SECTORS]
             self.d_time_ms = fields[DiskStatField.D_TIME_MS]
+        else:
+            self.d_io = self.d_merge = self.d_sect = self.d_time_ms = 0
 
         # flush fields (if available)
-        self.f_io = self.f_time_ms = 0
         if len(fields) >= 19:
             self.f_io      = fields[DiskStatField.F_IO_OPS]
             self.f_time_ms = fields[DiskStatField.F_TIME_MS]
+        else:
+            self.f_io = self.f_time_ms = 0
 
 
 class DiskStatDelta:
     """The delta between two `DiskStatRow`s. Used to compute the I/O rates between samples."""
+
     __slots__ = ('delta_t', 'rd_c', 'wr_c', 'disc_c', 'flush_c',
                  'rd_m', 'wr_m', 'dsc_m', 'rd_sect', 'wr_sect', 'dsc_sect',
                  'r_time', 'w_time', 'd_time', 'f_time', 'io_t', 'io_t_w')
@@ -283,6 +287,10 @@ class DiskStatDelta:
         self.f_time   = now.f_time_ms - prev.f_time_ms
         self.io_t     = now.io_t_ms   - prev.io_t_ms
         self.io_t_w   = now.io_t_w_ms - prev.io_t_w_ms
+
+    def was_inactive(self) -> bool:
+        """Whether there was no I/O activity in this delta."""
+        return (self.rd_c + self.wr_c + self.disc_c + self.flush_c) == 0
 
     def __getitem__(self, item: OutputField) -> float:
         if not isinstance(item, OutputField):
@@ -880,9 +888,13 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
             if delta is None:
                 continue
         else:
-            delta = DiskStatDelta(prev=prev[dev], now=now[dev])
+            try:
+                delta = DiskStatDelta(prev=prev[dev], now=now[dev])
+            except KeyError:
+                # no previous stats for device, skip it
+                continue
 
-        if state.hide and (delta.rd_c + delta.wr_c + delta.disc_c + delta.flush_c) == 0:
+        if state.hide and delta.was_inactive():
             continue
 
         row = [
@@ -899,23 +911,7 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
             fmt_cell(OutputField.QUEUE, 1),  fmt_cell(OutputField.UTIL, 2),
             ]
 
-        if state.aggr:  # add current RBD to the aggregate totals
-            tmp['size']  += mapping[dev].size
-            tmp['r_io']  += delta[OutputField.R_IOPS]
-            tmp['w_io']  += delta[OutputField.W_IOPS]
-            tmp['r_mb']  += delta[OutputField.R_MBPS]
-            tmp['w_mb']  += delta[OutputField.W_MBPS]
-            tmp['r_rqm'] += delta[OutputField.R_RQM]
-            tmp['w_rqm'] += delta[OutputField.W_RQM]
-            # weighted average aqu-sz and %util
-            if delta[OutputField.QUEUE] > 0:
-                tmp['n_queue'] += 1
-                tmp['queue'] += delta[OutputField.QUEUE]
-            if delta[OutputField.UTIL] > 0:
-                tmp['n_util'] += 1
-                tmp['util']  += delta[OutputField.UTIL]
-
-        if state.xtra:    # add discard+flush statistics if requested
+        if state.xtra:  # add discard+flush statistics if requested
             row.extend([
                 f"{delta[OutputField.D_IOPS]:.0f}",
                 f"{delta[OutputField.D_MBPS]:.1f}",
@@ -927,7 +923,22 @@ def parse_data(mapping: Dict[str, RadosBD], prev: Dict[str, DiskStatRow],
                 f"{delta[OutputField.F_WAIT]:.2f}",
                 ])
 
-            if state.aggr:
+        if state.aggr:  # add current RBD to the aggregate totals
+            tmp['size']  += mapping[dev].size
+            tmp['r_io']  += delta[OutputField.R_IOPS]
+            tmp['w_io']  += delta[OutputField.W_IOPS]
+            tmp['r_mb']  += delta[OutputField.R_MBPS]
+            tmp['w_mb']  += delta[OutputField.W_MBPS]
+            tmp['r_rqm'] += delta[OutputField.R_RQM]
+            tmp['w_rqm'] += delta[OutputField.W_RQM]
+            # weighted averages for aqu-sz and %util
+            if delta[OutputField.QUEUE] > 0:
+                tmp['n_queue'] += 1
+                tmp['queue'] += delta[OutputField.QUEUE]
+            if delta[OutputField.UTIL] > 0:
+                tmp['n_util'] += 1
+                tmp['util']  += delta[OutputField.UTIL]
+            if state.xtra:  # add extra stats if requested
                 tmp['d_io']  += delta[OutputField.D_IOPS]
                 tmp['d_mb']  += delta[OutputField.D_MBPS]
                 tmp['d_rqm'] += delta[OutputField.D_RQM]
